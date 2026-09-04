@@ -167,7 +167,7 @@ Multi-client dispatch:
 pip install pyserial PyQt5 pyqtgraph
 ```
 
-Python 3.8 or later. Compatible with Spyder IDE.
+Python 3.8 or later.
 
 ### Features
 
