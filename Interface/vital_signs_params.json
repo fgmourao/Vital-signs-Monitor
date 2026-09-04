@@ -1,0 +1,15 @@
+{
+  "HR_MIN": 40.0,
+  "HR_MAX": 200.0,
+  "HR_OUTLIER": 0.35,
+  "SPO2_MIN": 80.0,
+  "DECIM_RATIO": 1.0,
+  "LED": 80.0,
+  "ADC_RANGE": 16384.0,
+  "SAMPLE_AVG": 4.0,
+  "CALIB_SWING": 120.0,
+  "THRESH_INSP": 0.65,
+  "THRESH_EXP": 0.45,
+  "TEMP_MIN": 30.0,
+  "TEMP_MAX": 45.0
+}

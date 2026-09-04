@@ -1,0 +1,14 @@
+1. Para Gravar o Arduino Mega (ATmega2560)
+* ON: 1, 2, 3, 4
+* OFF: 5, 6, 7, 8
+
+2. Para Gravar o Módulo WiFi (ESP8266)
+* ON: 5, 6, 7
+* OFF: 1, 2, 3, 4, 8
+* Nota: Para gravar o ESP, certifique-se de que a pequena chave seletora ao lado não esteja interferindo e, dependendo da versão exata da sua placa, pode ser necessário segurar o pequeno botão "Mode" na hora de plugar o USB.
+
+3. Modo de Operação do Projeto (A Configuração Final)
+* Chaves DIP: Exatamente iguais às do Modo 1 (1, 2, 3, 4 em ON; resto em OFF). Isso mantém a porta Serial0livre para conversar com o Python e o PC.
+* Chave Seletora Menor: Mude a pequena chave deslizante na placa para a posição RXD3 / TXD3. Isso liga fisicamente a Serial3 do Arduino Mega aos pinos de comunicação do ESP8266.
+
+Resumindo: Para rodar com o software Python captando tudo via cabo e o Wi-Fi funcionando de backup, deixe as chaves 1 a 4 para cima, o resto para baixo, e a chavinha em RX3/TX3
