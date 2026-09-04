@@ -268,16 +268,10 @@ Arduino library dependencies (install via Arduino IDE Library Manager):
 
 ## Known Limitations
 
-- HR and SpO2 values are not validated against a calibrated reference instrument. For research use only.
+- HR and SpO2 values are not validated
 - The `_debug_serial()` diagnostic output is plain text and incompatible with the Python DAQ. Use it only with the Arduino IDE Serial Monitor when the Python application is not connected.
-- If the USB cable is disconnected during a recording session, the CSV files may be incomplete. Always stop recording before disconnecting.
+- If the USB cable is disconnected during a recording session, the CSV files may be incomplete.
 - Primary Wi-Fi client assignment is first-connect order. If a secondary workstation connects before the primary, it will receive 25 Hz instead of 100 Hz.
-
----
-
-## License
-
-Documentation licensed under Creative Commons Attribution-NonCommercial 4.0 International (CC BY-NC 4.0).
 
 ---
 
