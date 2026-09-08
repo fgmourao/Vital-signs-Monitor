@@ -110,6 +110,7 @@ from PyQt5.QtWidgets import (
 )
 from PyQt5.QtCore import QThread, QTimer, pyqtSignal, Qt
 import pyqtgraph as pg
+from fft_vitalsigns import FFTVitalSignsWindow
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -591,6 +592,7 @@ class PyVitalSignsDAQ(QMainWindow):
 
         # ── Waveform display buffers ──────────────────────────────────────────
         # Three parallel lists of length max_points (oldest discarded on append).
+        self._PLOT_WARMUP = 150
         self.max_points = 300           # ~3 s of history at 100 Hz
         self.ir_data    = [0] * self.max_points
         self.pz_data    = [0] * self.max_points
@@ -610,6 +612,7 @@ class PyVitalSignsDAQ(QMainWindow):
 
         self.serial_thread = None
         self.settings_dlg  = None
+        self.fft_dlg       = None
 
         self.init_ui()
 
@@ -643,6 +646,15 @@ class PyVitalSignsDAQ(QMainWindow):
         self.btn_settings.setEnabled(False)
         self.btn_settings.clicked.connect(self.open_settings)
 
+        self.btn_fft = QPushButton("FFT")
+        self.btn_fft.setStyleSheet(
+            "background-color: #333; color: #aaa; padding: 8px; "
+            "font-weight: bold; border: none; border-radius: 4px;")
+        self.btn_fft.setEnabled(False)
+        self.btn_fft.setToolTip("Open live Power Spectral Density viewer\n"
+                                "(IR-PPG red, Piezo gold)")
+        self.btn_fft.clicked.connect(self.open_fft)
+
         self.lbl_init_msg = QLabel("")
         self.lbl_init_msg.setStyleSheet(
             "color: #cccccc; font-size: 16px; font-weight: bold; margin-left: 30px;")
@@ -674,6 +686,7 @@ class PyVitalSignsDAQ(QMainWindow):
         top_bar.addWidget(self.combo_ports)
         top_bar.addWidget(self.btn_connect)
         top_bar.addWidget(self.btn_settings)
+        top_bar.addWidget(self.btn_fft)
         top_bar.addWidget(self.lbl_init_msg)
         top_bar.addStretch()
         top_bar.addWidget(self.btn_event)
@@ -785,6 +798,10 @@ class PyVitalSignsDAQ(QMainWindow):
             self.btn_settings.setStyleSheet(
                 "background-color: #1a5276; color: #fff; padding: 8px; "
                 "font-weight: bold; border: none; border-radius: 4px;")
+            self.btn_fft.setEnabled(True)
+            self.btn_fft.setStyleSheet(
+                "background-color: #1a3a1a; color: #6c6; padding: 8px; "
+                "font-weight: bold; border: none; border-radius: 4px;")
         else:
             self.serial_thread.stop()
             self.serial_thread = None
@@ -799,6 +816,12 @@ class PyVitalSignsDAQ(QMainWindow):
             self.btn_settings.setStyleSheet(
                 "background-color: #333; color: #aaa; padding: 8px; "
                 "font-weight: bold; border: none; border-radius: 4px;")
+            self.btn_fft.setEnabled(False)
+            self.btn_fft.setStyleSheet(
+                "background-color: #333; color: #aaa; padding: 8px; "
+                "font-weight: bold; border: none; border-radius: 4px;")
+            if self.fft_dlg and self.fft_dlg.isVisible():
+                self.fft_dlg.close()
 
     def _request_params(self):
         """
@@ -823,6 +846,20 @@ class PyVitalSignsDAQ(QMainWindow):
     # ─────────────────────────────────────────────────────────────────────────
     # SETTINGS
     # ─────────────────────────────────────────────────────────────────────────
+
+    def open_fft(self):
+        """
+        Open the live PSD viewer (FFTVitalSignsWindow).
+        Non-modal — stays open alongside the main DAQ window.
+        Only one instance at a time; if already open, bring to front.
+        """
+        if self.fft_dlg is None or not self.fft_dlg.isVisible():
+            self.fft_dlg = FFTVitalSignsWindow(daq_window=self, parent=self)
+            self.fft_dlg.setModal(False)
+            self.fft_dlg.show()
+        else:
+            self.fft_dlg.raise_()
+            self.fft_dlg.activateWindow()
 
     def open_settings(self):
         """
@@ -857,6 +894,7 @@ class PyVitalSignsDAQ(QMainWindow):
         # Disconnect curves (empty data) so pyqtgraph draws no connecting line
         self.curve_ir.setData([], [])
         self.curve_pz.setData([], [])
+        self._buffer_fill = 0
         self.is_paused = False
 
     # ─────────────────────────────────────────────────────────────────────────
@@ -1032,8 +1070,10 @@ class PyVitalSignsDAQ(QMainWindow):
         self.ts_data.append(ts_ms); self.ts_data.pop(0)
 
         # Step 6
-        self.curve_ir.setData(self.ts_data, self.ir_data)
-        self.curve_pz.setData(self.ts_data, self.pz_data)
+        self._buffer_fill = getattr(self, '_buffer_fill', self._PLOT_WARMUP) + 1
+        if self._buffer_fill >= self._PLOT_WARMUP:
+            self.curve_ir.setData(self.ts_data, self.ir_data)
+            self.curve_pz.setData(self.ts_data, self.pz_data)
 
         # Step 7
         self.plot_ir.setXRange(self.ts_data[0], self.ts_data[-1], padding=0)
