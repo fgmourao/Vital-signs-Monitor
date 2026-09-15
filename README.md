@@ -1,5 +1,5 @@
 # Vital-signs Monitor v1.0
-** Under development
+> **Under development**
 
 Real-time, non-invasive physiological monitoring during experimental surgeries, stereotaxic procedures, and deep anaesthesia protocols in small rodents. ATmega2560 acquisition board controlled by a Python/PyQt5 application over USB, with simultaneous Wi-Fi browser dashboard via an on-board ESP8266.
 
@@ -11,7 +11,7 @@ Four physiological parameters are acquired simultaneously:
 
 - **Heart Rate** — MAX30102 optical sensor (IR channel), SparkFun `checkForBeat()` peak detector, rolling mean over N=6 beats
 - **SpO2** — MAX30102 Red + IR channels, Maxim `spo2_algorithm` (sliding window: retain 75, refill 25 per update)
-- **Respiratory Rate** — piezo respiratory belt (A0), software Schmitt trigger with adaptive envelope calibration every 2 s
+- **Respiratory Rate** — respiratory sensor at A0 (piezo film or FSR406 pressure sensor), software Schmitt trigger with adaptive envelope calibration every 2 s
 - **Core Temperature** — NTC 100 kΩ rectal thermistor (A1), Beta equation conversion
 
 All parameters are streamed at 100 Hz to the Python DAQ via USB-Serial and to a browser dashboard via WebSocket over Wi-Fi.
@@ -37,7 +37,7 @@ ATmega2560 (RobotDyn Mega+WiFi)
       │        ├─ MAX30102 optical sensor (address 0x57)                      │
       │        └─ SSD1306 OLED 128×32 (address 0x3C)                          │
       │                                                                        │
-      ├─ A0 — Piezo respiratory belt                                           │
+      ├─ A0 — Respiratory sensor (piezo film or FSR406 pressure sensor)       │
       ├─ A1 — NTC rectal thermistor                                            │
       │                                                                        │
       └─ Free-running ADC (~9.6 kHz) + TIMER1 CTC (100 Hz)                   │
@@ -69,7 +69,7 @@ MAX30102 internal (400 Hz raw)
 ### Respiratory Rate
 
 ```
-Piezo belt → A0
+Respiratory sensor (A0)
     └─ ADC_vect free-running ~9.6 kHz (ISR)
               └─ TIMER1_COMPA_vect 100 Hz CTC (ISR)
                        └─ N=4 moving average
@@ -77,6 +77,19 @@ Piezo belt → A0
                                          └─ adaptive envelope calibration every 2 s
                                                   └─ respRate (rpm)
 ```
+
+### Respiratory Sensor Signal Conditioning (Python)
+
+The raw ADC counts from the respiratory sensor are processed in Python before display and CSV recording:
+
+1. **Unit conversion** — counts → mV (10-bit ADC, 5 V reference: 1 count ≈ 4.89 mV)
+2. **DC baseline removal** — IIR low-pass filter (α = 0.005 @ 100 Hz, fc ≈ 0.08 Hz) tracks slow drift from animal weight and posture. Time constant ~200 s.
+3. **Polarity correction** — controlled by `_INVERT_RESP` constant:
+   - `True` (default): FSR406 and piezo where inspiration causes a voltage drop
+   - `False`: piezo where inspiration already produces a positive peak
+4. **Resp. Tare** — forces immediate convergence of the DC estimate when the animal is placed on the sensor
+
+The same processing is applied in the browser dashboard JavaScript.
 
 ### Temporal Alignment
 
@@ -141,7 +154,7 @@ Inbound — read all parameters:
 | `LED` | g_LED_BRIGHTNESS | MAX30102 | LED drive current (1–255) — reruns sensor setup |
 | `ADC_RANGE` | g_ADC_RANGE | MAX30102 | ADC full-scale (2048/4096/8192/16384) — reruns setup |
 | `SAMPLE_AVG` | g_SAMPLE_AVERAGE | MAX30102 | Hardware averaging per FIFO entry — reruns setup |
-| `CALIB_SWING` | g_CALIB_MIN_SWING | monitor | Minimum piezo envelope swing (ADC counts) |
+| `CALIB_SWING` | g_CALIB_MIN_SWING | monitor | Minimum respiratory sensor swing (mV) for valid calibration |
 | `THRESH_INSP` | g_THRESH_INSP_FRAC | monitor | Inspiration threshold fraction (0.40–0.85) |
 | `THRESH_EXP` | g_THRESH_EXP_FRAC | monitor | Expiration threshold fraction (0.20–0.70) |
 | `TEMP_MIN` | g_TEMP_MIN_C | monitor | Temperature lower physiological gate (°C) |
@@ -151,7 +164,7 @@ Inbound — read all parameters:
 
 ## Wi-Fi Dashboard
 
-The ESP8266 creates a Wi-Fi access point (`SSID: RODENT_MONITOR`) and serves an HTML dashboard at `http://192.168.4.1`. A WebSocket server on port 81 forwards the 100 Hz JSON stream to connected browsers.
+The ESP8266 creates a Wi-Fi access point (`SSID: Vital_Signs_Web_Monitor`) and serves an HTML dashboard at `http://192.168.4.1`. A WebSocket server on port 81 forwards the 100 Hz JSON stream to connected browsers. The browser applies the same respiratory signal conditioning as the Python DAQ (mV conversion, DC removal, polarity correction).
 
 Multi-client dispatch:
 - **Primary client** (first to connect): receives every packet → 100 Hz
@@ -164,24 +177,25 @@ Multi-client dispatch:
 ### Requirements
 
 ```
-pip install pyserial PyQt5 pyqtgraph
+pip install pyserial PyQt5 pyqtgraph scipy numpy
 ```
 
-Python 3.8 or later.
+Python 3.8 or later. Compatible with Spyder IDE.
 
 ### Features
 
-- Real-time scrolling waveform display (IR-PPG and piezo respiratory belt)
+- Real-time scrolling waveform display (IR-PPG and respiratory sensor)
 - Numeric readouts: HR, SpO2, respiratory rate, core temperature
 - Arduino timestamp (`"ts"`) used as the common X-axis — eliminates USB transport jitter from recorded data
-- **Settings panel** — runtime adjustment of all sensor and algorithm parameters without recompilation; changes saved to EEPROM automatically
-- **Help panel** — parameter reference with species-specific suggested values
+- **Settings panel** — runtime adjustment of all sensor and algorithm parameters without recompilation; changes saved to EEPROM automatically; values auto-synced from Arduino on connect
+- **Help panel** — parameter reference with species-specific suggested values and tooltips on every field
+- **FFT viewer** — live power spectral density for both IR-PPG and respiratory channels (Welch method, configurable window and segment length)
+- **Resp. Tare** — instant respiratory sensor baseline zeroing; cancels animal weight offset without waiting for IIR filter convergence
 - **Event marker** — intra-session surgical event marking with visual timeline markers on both waveforms
 - **CSV recording** split into two files:
   - `*_vitals.csv` — low-rate physiological values, wall-clock time axis
-  - `*_raw.csv` — high-rate raw samples, Arduino timestamp axis (`TS_Arduino_ms`)
+  - `*_raw.csv` — high-rate conditioned waveform samples, Arduino timestamp axis (`TS_Arduino_ms`)
 - Pause / Resume without disconnecting
-- Auto-synchronisation of Settings values from Arduino on connect
 
 ### CSV Output Format
 
@@ -192,7 +206,7 @@ Python 3.8 or later.
 | Time_Seconds | Wall-clock elapsed time since REC start (s) |
 | HeartRate_BPM | HR from MAX30102 ring buffer (BPM) |
 | SpO2_% | SpO2 from Maxim algorithm (%) |
-| RespRate_RPM | Respiratory rate from piezo detector (rpm) |
+| RespRate_RPM | Respiratory rate from sensor detector (rpm) |
 | Temperature_C | NTC rectal temperature (°C) |
 | Event_Marker | "Event Start" on marked rows |
 
@@ -202,9 +216,22 @@ Python 3.8 or later.
 |---|---|
 | Time_Seconds | Wall-clock elapsed time — for cross-reference only |
 | TS_Arduino_ms | Arduino millis(), normalised to 0 at REC start — **use this as the time axis for signal analysis** |
-| IR_Raw | Raw IR count from MAX30102 FIFO (counts) |
-| Piezo_Raw | Filtered piezo ADC value (0–1023) |
+| IR_Raw | Raw IR count from MAX30102 FIFO (counts, 18-bit) |
+| Resp_mV | Respiratory sensor signal in mV — DC-removed and polarity-corrected; inspiration = positive peak. NOT the raw ADC value. |
 | Event_Marker | 1 on event rows, 0 otherwise |
+
+---
+
+## Respiratory Sensor
+
+The system is compatible with two sensor types connected to A0 via a voltage divider (R_fixed in series to VCC):
+
+| Sensor type | R_fixed | Notes |
+|---|---|---|
+| FSR406 pressure sensor | 10 kΩ | Set `_INVERT_RESP = True`. Place under the animal. Target DC ~2500 mV with animal weight. |
+| Piezo film sensor | Depends on interface circuit | Set `_INVERT_RESP` based on observed polarity. Inherently AC — Resp. Tare less critical. |
+
+**Optimal operating point:** DC level ≈ 2500 mV (mid-range) with the animal positioned. If DC is below 1000 mV, reduce R_fixed. If above 4000 mV, increase R_fixed. Adjust Calib Min Swing (default 586 mV) downward for animals with shallow breathing.
 
 ---
 
@@ -225,13 +252,16 @@ Target IR raw DC level: 50,000–130,000 counts (20–50% of ADC full-scale). Ve
 ## Design Tradeoffs
 
 **[T1] DECIM_RATIO = 1**
-The Maxim `spo2_algorithm.cpp` FIR filters were designed for 25 Hz input (DECIM_RATIO = 4). With DECIM_RATIO = 1 the algorithm receives 100 Hz. Human bench tests show physiologically correct SpO2 (97–99%). Performance at rodent cardiac frequencies (300–600 BPM) is untested — if systematic SpO2 underestimation is observed, increase DECIM_RATIO via Settings.
+The Maxim `spo2_algorithm.cpp` FIR filters were designed for 25 Hz input (DECIM_RATIO = 4). With DECIM_RATIO = 1 the algorithm receives 100 Hz. Human bench tests show physiologically correct SpO2 (97–99%). Performance at rodent cardiac frequencies (300–600 BPM) is untested — if systematic SpO2 overestimation (e.g. constant 100%) is observed, increase DECIM_RATIO to 4 via Settings.
 
 **[T2] checkForBeat() with hardware-averaged signal**
 The SparkFun `checkForBeat()` detector was calibrated for unaveraged signals. With `sampleAverage = 4` the AC component is smoothed before detection. If HR detection fails on rodents, reduce `sampleAverage` to 1 via Settings to restore full AC amplitude at 400 Hz.
 
 **[T3] ADC Range**
 `adcRange = 16384` is required for human fingertip at LED = 80 to avoid saturation (IR DC reaches 262,143 = 18-bit ceiling). For rodent thin tissue, try `adcRange = 4096` and verify IR raw in the waveform plot.
+
+**[T4] IIR DC baseline convergence**
+The respiratory signal DC filter has a time constant of ~200 s at 100 Hz. When the animal is first placed on the sensor, the display may appear shifted until the filter converges. Use **Resp. Tare** to force immediate convergence.
 
 ---
 
@@ -242,7 +272,7 @@ The SparkFun `checkForBeat()` detector was calibrated for unaveraged signals. Wi
 | Microcontroller | RobotDyn Mega+WiFi (ATmega2560 + ESP8266) |
 | Optical sensor | MAX30102 breakout — I²C, address 0x57, 3.3 V |
 | Display | SSD1306 OLED 128×32 — I²C, address 0x3C |
-| Respiratory sensor | Piezo belt → A0 |
+| Respiratory sensor | Piezo film or FSR406 → A0 (voltage divider with R_fixed to VCC) |
 | Temperature probe | NTC 100 kΩ rectal thermistor → A1 (series 100 kΩ to VCC) |
 | USB | ATmega2560 USB-Serial bridge (Arduino IDE upload port) |
 
@@ -252,12 +282,14 @@ The SparkFun `checkForBeat()` detector was calibrated for unaveraged signals. Wi
 
 | File | Description |
 |---|---|
-| `surgery_monitor.ino` | Main sketch — ISRs, task scheduler, OLED display |
-| `surgery_monitor_MAX30102.ino` | MAX30102 HR + SpO2, EEPROM persistence, runtime config |
-| `Py_Vital-Signs.ino` | USB bidirectional stream — 100 Hz outbound + inbound command parser |
-| `surgery_monitor_web_server.ino` | ESP8266 Wi-Fi bridge — 100 Hz JSON to Serial3 |
-| `ESP8266_VitalSigns_Server.ino` | ESP8266 firmware — Wi-Fi AP, HTTP dashboard, WebSocket server |
+| `surgery_monitor.ino` | Main sketch — ISRs, task scheduler, OLED display, monitor_set_param() |
+| `surgery_monitor_MAX30102.ino` | MAX30102 HR + SpO2, EEPROM persistence, max30102_set_param() |
+| `Py_Vital-Signs.ino` | USB bidirectional stream — 100 Hz outbound + SOH command parser |
+| `surgery_monitor_web_server.ino` | Serial3 → ESP8266 JSON bridge at 100 Hz |
+| `ESP8266_VitalSigns_Server.ino` | ESP8266 firmware — Wi-Fi AP, HTTP dashboard, WebSocket multi-client |
+| `MAX30102_Diagnostic_Tool.ino` | Standalone diagnostic sketch — IR waveform and SpO2 algorithm analysis |
 | `Py_VitalSigns_DAQ.py` | Python DAQ application (PyQt5 + pyqtgraph) |
+| `fft_vitalsigns.py` | Live PSD viewer — Welch method for HR and respiratory spectral analysis |
 
 Arduino library dependencies (install via Arduino IDE Library Manager):
 - **SparkFun MAX3010x Pulse and Proximity Sensor Library**
@@ -268,10 +300,12 @@ Arduino library dependencies (install via Arduino IDE Library Manager):
 
 ## Known Limitations
 
-- HR and SpO2 values are not validated
-- The `_debug_serial()` diagnostic output is plain text and incompatible with the Python DAQ. Use it only with the Arduino IDE Serial Monitor when the Python application is not connected.
-- If the USB cable is disconnected during a recording session, the CSV files may be incomplete.
+- HR and SpO2 values are not validated against a calibrated reference instrument. For research use only.
+- SpO2 may read 100% consistently when DECIM_RATIO = 1 — increase to 4 via Settings if this occurs.
+- The `_debug_serial()` diagnostic output is plain text and incompatible with the Python DAQ. Use only with the Arduino IDE Serial Monitor when the Python application is not connected.
+- If the USB cable is disconnected during a recording session, the CSV files may be incomplete. Always stop recording before disconnecting.
 - Primary Wi-Fi client assignment is first-connect order. If a secondary workstation connects before the primary, it will receive 25 Hz instead of 100 Hz.
+- The Resp. Tare is session-only — it resets if the application is restarted or the connection is toggled.
 
 ---
 
