@@ -1,6 +1,6 @@
 /**
  * @file    ESP8266_VitalSigns_Server.ino
- * PROJECT: Vital-signs monitor
+ * PROJECT: Vital-signs monitor — small rodents (rat / mouse)
  * @version 3.0 (Multi-client)
  * @author  Flávio Mourão — Mar, 2026
  *
@@ -84,9 +84,9 @@
  * ═══════════════════════════════════════════════════════════════════════════════
  * BANDWIDTH BUDGET (worst case: 5 clients)
  * ═══════════════════════════════════════════════════════════════════════════════
- *  Primary (1×):    55 B × 100 Hz = 5.5 kB/s
- *  Secondary (4×):  55 B × 25 Hz × 4 = 22 kB/s
- *  Total:           ~27.5 kB/s << ESP8266 Wi-Fi ~1 MB/s capacity
+ *  Primary (1×):    65 B × 100 Hz = 6.5 kB/s
+ *  Secondary (4×):  65 B × 25 Hz × 4 = 26 kB/s
+ *  Total:           ~32.5 kB/s << ESP8266 Wi-Fi ~1 MB/s capacity
  *
  * ═══════════════════════════════════════════════════════════════════════════════
  * KNOWN LIMITATIONS
@@ -225,12 +225,12 @@ const char index_html[] PROGMEM = R"rawliteral(
         </div>
         <div class="main-content">
             <div class="chart-container">
-                <div class="chart-title" style="color:#b30000;">PPG — IR Optical (MAX30102)</div>
+                <div class="chart-title" style="color:#b30000;">Photoplethysmography</div>
                 <canvas id="canvas_ir"></canvas>
             </div>
             <div class="chart-container">
-                <div class="chart-title" style="color:#cca300;">RESP — Piezo Belt</div>
-                <canvas id="canvas_piezo"></canvas>
+                <div class="chart-title" style="color:#cca300;">Respiratory Excursions</div>
+                <canvas id="canvas_resp"></canvas>
             </div>
         </div>
     </div>
@@ -238,18 +238,18 @@ const char index_html[] PROGMEM = R"rawliteral(
     <script>
         const maxPoints = 300;
         let bufIR    = new Array(maxPoints).fill(0);
-        let bufPiezo = new Array(maxPoints).fill(0);
+        let bufResp = new Array(maxPoints).fill(0);
 
         const canIR    = document.getElementById('canvas_ir');
         const ctxIR    = canIR.getContext('2d');
-        const canPiezo = document.getElementById('canvas_piezo');
-        const ctxPiezo = canPiezo.getContext('2d');
+        const canResp = document.getElementById('canvas_resp');
+        const ctxResp = canResp.getContext('2d');
 
         function resizeCanvases() {
             canIR.width    = canIR.parentElement.clientWidth  - 16;
             canIR.height   = canIR.parentElement.clientHeight - 16;
-            canPiezo.width  = canPiezo.parentElement.clientWidth  - 16;
-            canPiezo.height = canPiezo.parentElement.clientHeight - 16;
+            canResp.width  = canResp.parentElement.clientWidth  - 16;
+            canResp.height = canResp.parentElement.clientHeight - 16;
         }
         window.addEventListener('resize', resizeCanvases);
         resizeCanvases();
@@ -258,6 +258,27 @@ const char index_html[] PROGMEM = R"rawliteral(
         var websocket;
         var statusDot  = document.getElementById('status-dot');
         var roleLabel  = document.getElementById('client-role');
+
+        // ── Respiratory sensor signal conditioning ────────────────────────────
+        // Matches the processing applied in Py_VitalSigns_DAQ.py (update_gui Step 2b).
+        // The firmware sends raw ADC counts (0-1023); this JS converts to mV,
+        // removes the DC baseline (animal weight offset), and optionally inverts
+        // so that inspiratory peaks are positive.
+        //
+        // INVERT_RESP: true  = FSR406 or piezo where inspiration is a voltage drop.
+        //              false = piezo where inspiration is already a voltage rise.
+        const ADC_MV      = 5000.0 / 1023.0;   // 10-bit, 5 V ref: ~4.8875 mV/count
+        const INVERT_RESP = true;               // change to false if peaks already positive
+        const IIR_ALPHA   = 0.005;              // fc ≈ 0.08 Hz @ 25 Hz (secondary stream)
+        var   respDc      = null;               // IIR DC baseline estimate
+
+        function processResp(pzRaw) {
+            var mV = pzRaw * ADC_MV;
+            if (respDc === null) respDc = mV;   // initialise on first sample
+            respDc += IIR_ALPHA * (mV - respDc);
+            var ac = INVERT_RESP ? (respDc - mV) : (mV - respDc);
+            return ac + respDc;
+        }
 
         function initWebSocket() {
             websocket = new WebSocket(gateway);
@@ -310,7 +331,7 @@ const char index_html[] PROGMEM = R"rawliteral(
                     (obj.t > 0 ? obj.t.toFixed(1) : '--.-') + ' <span class="unit">°C</span>';
 
                 bufIR.push(obj.ir);    bufIR.shift();
-                bufPiezo.push(obj.pz); bufPiezo.shift();
+                bufResp.push(processResp(obj.pz)); bufResp.shift();
 
                 requestAnimationFrame(drawCharts);
 
@@ -344,9 +365,8 @@ const char index_html[] PROGMEM = R"rawliteral(
         }
 
         function drawCharts() {
-            drawSingleChart(ctxIR,    canIR,    bufIR,    '#b30000', 100); // Vermelho escuro
-            drawSingleChart(ctxPiezo, canPiezo, bufPiezo, '#cca300', 20);  // Amarelo escuro
-            // ────────────────────────────────────────────────────
+            drawSingleChart(ctxIR,    canIR,    bufIR,    '#b30000', 100);   // IR-PPG (red)
+            drawSingleChart(ctxResp,  canResp,  bufResp,  '#cca300', 50);   // Respiratory (gold) — minRange 50 mV
         }
 
         initWebSocket();
@@ -502,7 +522,7 @@ void loop()
             rxBuffer += c;
 
             // Guard against a runaway buffer if '\n' never arrives
-            // (e.g., Mega reset mid-packet). 128 bytes >> max packet length (~55 B).
+            // (e.g., Mega reset mid-packet). 128 bytes >> max packet length (~65 B).
             if (rxBuffer.length() > 128) {
                 rxBuffer = "";
             }

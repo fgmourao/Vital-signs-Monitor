@@ -681,7 +681,7 @@ void setup()
 
     u8g2.clearBuffer();
 
-    // MAX30102 init [MEGA ONLY] — defined in surgery_monitor_MAX30102.ino.
+    // Check sensor - MAX30102 init — defined in surgery_monitor_MAX30102.ino.
     // Halt on failure: sensor required for full multiparametric operation.
     if (!max30102_init()) {
         u8g2.clearBuffer();
@@ -691,7 +691,7 @@ void setup()
         u8g2.setCursor(0, 26);
         u8g2.print(F("Check wiring / I2C"));
         u8g2.sendBuffer();
-        while (true);
+        while (false); // return to true in case to stop
     }
 
     vitalsigns_init();      // ESP8266 WebSocket stream (Serial3)
@@ -812,8 +812,9 @@ void loop()
         // Map filtered ADC value to display row using current calibrated envelope.
         // constrain() prevents Y from leaving the waveform area if the signal
         // transiently exceeds the calibrated bounds between calibration passes.
+        const int pzInv = envelopeMin + envelopeMax - safeADC;   // mirror around envelope centre
         const int yNow = constrain(
-            map(safeADC, envelopeMin, envelopeMax, WAVE_Y_BOTTOM, WAVE_Y_TOP),
+            map(pzInv, envelopeMin, envelopeMax, WAVE_Y_BOTTOM, WAVE_Y_TOP),
             WAVE_Y_TOP, WAVE_Y_BOTTOM
         );
 

@@ -16,8 +16,11 @@ acquired by the vital-signs monitor:
                      Rat:       3.3–8.3 Hz  (200–500 BPM)
                      Mouse:     4.2–13.3 Hz (250–800 BPM)
 
-  Piezo   (gold) — Respiratory belt signal. The dominant peak corresponds
-                   to respiratory rate. Expected range:
+  Resp.   (gold) — Respiratory sensor signal. The dominant
+                   peak corresponds to respiratory rate. Signal is in mV,
+                   DC-baseline removed and inverted (inspiration = positive
+                   peak) — same processing as the main display.
+                   Expected range:
                      Rat anaest.:   1.2–1.5 Hz (70–90 rpm)
                      Mouse anaest.: 1.3–2.0 Hz (80–120 rpm)
 
@@ -63,7 +66,7 @@ class FFTVitalSignsWindow(QDialog):
 
     Two curves are always shown simultaneously:
       Red  — IR-PPG power spectrum
-      Gold — Piezo respiratory belt power spectrum
+      Gold — Respiratory sensor power spectrum
 
     Controls:
       Window (s)      — history length fed into Welch's method. More history
@@ -176,7 +179,14 @@ class FFTVitalSignsWindow(QDialog):
         self.plot = pg.PlotWidget()
         self.plot.setBackground('#0d0d0d')
         self.plot.setLabel('bottom', 'Frequency', 'Hz')
-        self.plot.setLabel('left', 'PSD (a.u.)')
+        self.plot.setLabel('left', 'PSD')
+        # Signal units per channel:
+        #   IR   — raw 18-bit counts from MAX30102 photodetector.
+        #          PSD units: counts²/Hz.
+        #   Resp. — mV after DC removal and polarity correction (see update_gui Step 2b).
+        #           PSD units: mV²/Hz.
+        # Both are suitable for spectral peak detection; absolute PSD magnitudes
+        # are not directly comparable between channels due to different units.
         self.plot.getAxis('left').enableAutoSIPrefix(False)
         self.plot.showGrid(x=True, y=True, alpha=0.25)
         self.plot.addLegend(offset=(10, 10))
@@ -184,7 +194,7 @@ class FFTVitalSignsWindow(QDialog):
         self.curve_ir = self.plot.plot(
             pen=pg.mkPen('#b30000', width=2), name='IR-PPG (Heart Rate)')
         self.curve_pz = self.plot.plot(
-            pen=pg.mkPen('#cca300', width=2), name='Piezo (Resp. Rate)')
+            pen=pg.mkPen('#cca300', width=2), name='Respiratory Rate')
 
         layout.addWidget(self.plot, 1)
 
@@ -234,9 +244,9 @@ class FFTVitalSignsWindow(QDialog):
         Reads directly from the DAQ window's live buffers — no data copy,
         no serial access.
         """
-        ts   = self.daq.ts_data
-        ir   = self.daq.ir_data
-        pz   = self.daq.pz_data
+        ts   = self.daq.ts_data    # Arduino timestamps (ms)
+        ir   = self.daq.ir_data    # IR raw counts from MAX30102
+        pz   = self.daq.pz_data    # Respiratory sensor in mV, DC-removed, polarity-corrected
 
         # Need at least a few samples to estimate fs and compute a PSD.
         if len(ts) < 20:
@@ -289,7 +299,8 @@ class FFTVitalSignsWindow(QDialog):
             f"fs ≈ {fs:.1f} Hz  |  N = {len(ir_win)} samples  |  "
             f"Δf ≈ {delta_f:.3f} Hz  |  "
             f"IR peak: {peak_ir_hz:.2f} Hz ({peak_ir_hz * 60:.0f} BPM)  |  "
-            f"Piezo peak: {peak_pz_hz:.2f} Hz ({peak_pz_hz * 60:.0f} rpm)")
+            f"Resp. peak: {peak_pz_hz:.2f} Hz ({peak_pz_hz * 60:.0f} rpm)  "
+            f"[IR: counts²/Hz  |  Resp.: mV²/Hz]")
 
     def closeEvent(self, event):
         self.timer.stop()

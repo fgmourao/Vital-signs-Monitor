@@ -2,9 +2,9 @@
 Py_VitalSigns_DAQ.py
 ====================
 PROJECT : Vital-signs monitor
-VERSION : 3.0
+VERSION : 1.0
 AUTHOR  : Flávio Mourão — Mar, 2026
-Last update - Set 4, 2026
+Last update : Sep, 2026
 
 ════════════════════════════════════════════════════════════════════════════════
 MODULE RESPONSIBILITY
@@ -13,7 +13,7 @@ Standalone USB data-acquisition and real-time display application for the
 rodent vital-signs monitor. Receives a 100 Hz JSON stream from the ATmega2560
 over USB-Serial and provides:
 
-  - Real-time scrolling waveform display (IR-PPG and piezo respiratory belt)
+  - Real-time scrolling waveform display (IR-PPG and respiratory sensor waveform)
   - Numeric readouts: HR, SpO2, respiratory rate, core temperature
   - Intra-session event marking with visual timeline markers on both waveforms
   - CSV recording split into two files:
@@ -21,13 +21,15 @@ over USB-Serial and provides:
       *_raw.csv    — high-rate raw waveform samples, Arduino timestamp axis
   - Settings panel for runtime parameter adjustment via bidirectional Serial
     protocol — no recompilation required
+  - Resp. Tare button for instant respiratory sensor baseline zeroing
+  - Live PSD viewer (FFT) for heart rate and respiratory rate spectral analysis
 
 ════════════════════════════════════════════════════════════════════════════════
 TEMPORAL ALIGNMENT ARCHITECTURE
 ════════════════════════════════════════════════════════════════════════════════
 The firmware produces two signals with fundamentally different time domains:
 
-  Piezo (pz): captured by TIMER1_COMPA_vect — hardware ISR at exactly 100 Hz,
+  Resp. sensor (pz): captured by TIMER1_COMPA_vect — hardware ISR at exactly 100 Hz,
               fully deterministic.
 
   IR (ir):    read from the MAX30102 FIFO inside loop() — cooperative
@@ -54,7 +56,9 @@ JSON PACKET FORMAT  (defined in Py_Vital-Signs.ino)
   hr  — heart rate (BPM, int). 0 = no valid signal.
   sp  — SpO2 (%, int). 0 = no valid signal.
   rr  — respiratory rate (rpm, int). 0 = apnoea or no signal.
-  pz  — piezo ADC filtered value (10-bit counts, 0-1023).
+  pz  — respiratory sensor ADC value (10-bit counts, 0–1023).
+         Converted to mV and conditioned (DC removal + inversion) in Python
+         before display and CSV recording. See update_gui() Step 2b.
   t   — core temperature (deg C, one decimal). 0 = probe disconnected.
   ir  — raw IR photodetector count from MAX30102 (uint32, 0-262143).
   ts  — ATmega2560 millis() at packet serialisation time (ms, uint32).
@@ -73,8 +77,11 @@ CSV OUTPUT FORMAT
     Event_Marker
 
   *_raw.csv
-    Time_Seconds, TS_Arduino_ms, IR_Raw, Piezo_Raw, Event_Marker
+    Time_Seconds, TS_Arduino_ms, IR_Raw, Resp_mV, Event_Marker
     USE TS_Arduino_ms (not Time_Seconds) as the time axis for signal analysis.
+    Resp_mV: respiratory sensor signal in millivolts. DC-baseline removed;
+             polarity corrected (_INVERT_RESP) so inspiratory peaks are positive.
+             Tare offset applied if Resp. Tare was clicked. NOT the raw ADC value.
 
 ════════════════════════════════════════════════════════════════════════════════
 DEPENDENCIES
@@ -89,7 +96,7 @@ DEPENDENCIES
 ════════════════════════════════════════════════════════════════════════════════
 HARDWARE CONTEXT
 ════════════════════════════════════════════════════════════════════════════════
-  Board  : RobotDyn Mega+WiFi (ATmega2560 + ESP8266 on-board co-processor)
+  Board  : Mega+WiFi (ATmega2560 + ESP8266 on-board co-processor)
   USB    : ATmega2560 USB-Serial bridge
   Baud   : 115200
   Stream : JSON lines at 100 Hz, terminated by newline
@@ -111,6 +118,25 @@ from PyQt5.QtWidgets import (
 from PyQt5.QtCore import QThread, QTimer, pyqtSignal, Qt
 import pyqtgraph as pg
 from fft_vitalsigns import FFTVitalSignsWindow
+
+# ADC conversion: 10-bit, 5 V reference → 1 count = 5000/1023 mV
+_ADC_MV = 5000.0 / 1023.0   # ≈ 4.8875 mV per count
+
+# Respiratory sensor polarity:
+#
+#   FSR406 (pressure resistive sensor):
+#     Inspiration compresses the sensor → resistance drops → ADC voltage drops.
+#     Inversion required so inspiration appears as a positive peak.
+#     Set _INVERT_RESP = True.
+#
+#   Piezo film (piezoelectric sensor):
+#     Polarity depends on mounting orientation and circuit interface.
+#     If inspiration appears as a VALLEY in the raw signal → set True.
+#     If inspiration appears as a PEAK  in the raw signal → set False.
+#     DC tare is less critical: piezo film is inherently AC
+#     (no static charge accumulation, no animal-weight offset).
+#
+_INVERT_RESP = True   # change to False if sensor already delivers positive peaks
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -277,12 +303,12 @@ class HelpDialog(QDialog):
       <span class="unit">Default: 4 → 100 Hz effective</span></li>
 </ul>
 
-<h2>Piezo / Respiratory Rate</h2>
+<h2>Respiratory Rate</h2>
 <ul>
-  <li><span class="key">Calib Min Swing</span> — Minimum ADC envelope swing (counts) required
-      for the calibration to be considered valid. Increase in noisy environments;
+  <li><span class="key">Calib Min Swing</span> — Minimum respiratory sensor signal swing (mV)
+      required for calibration to be valid. Increase in noisy environments;
       decrease for animals with shallow breathing.
-      <span class="unit">Range: 20–400 counts</span></li>
+      <span class="unit">Range: 50–1950 mV | Default: 586 mV ≈ 120 ADC counts</span></li>
   <li><span class="key">Insp Threshold</span> — Fraction of the signal envelope at which
       an inspiration is detected (Schmitt trigger upper threshold).
       Must be &gt; Exp Threshold + 0.05.
@@ -355,31 +381,64 @@ class SettingsDialog(QDialog):
     data is lost and the port is never shared between threads.
     """
     
-    # (label, key, type, min, max, step, decimals, default, unit)
+    # Tuple format: (label, key, type, min, max, step, decimals, default, tooltip)
+    # Units are shown in the label (in parentheses) — spinner fields are unit-free.
 
     PARAMS = {
         "Heart Rate": [
-            ("HR Min",          "HR_MIN",    "float", 20,   780,  10,   0, 40,    "BPM"),
-            ("HR Max",          "HR_MAX",    "float", 50,   800,  10,   0, 200,   "BPM"),
-            ("Outlier Frac",    "HR_OUTLIER","float", 0.10, 0.70, 0.05, 2, 0.35,  ""),
+            ("HR Min (BPM)",        "HR_MIN",     "float", 20,   780,  10,   0, 40,
+             "Lower physiological gate. Beats slower than this are rejected.\n"
+             "Human: 40 | Rat: 200 | Mouse: 250"),
+            ("HR Max (BPM)",        "HR_MAX",     "float", 50,   800,  10,   0, 200,
+             "Upper physiological gate. Beats faster than this are rejected.\n"
+             "Human: 200 | Rat: 500 | Mouse: 800"),
+            ("Outlier Frac",        "HR_OUTLIER", "float", 0.10, 0.70, 0.05, 2, 0.35,
+             "Maximum deviation from rolling mean before a beat is discarded.\n"
+             "0.35 = 35%. Lower = cleaner data; higher = tolerates rapid rate changes."),
         ],
         "SpO2": [
-            ("Min Valid SpO2",  "SPO2_MIN",  "float", 50,   95,   5,    0, 80,    "%"),
-            ("Decim Ratio",     "DECIM_RATIO","int",  1,    4,    1,    0, 1,     ""),
+            ("Min Valid SpO2 (%)",  "SPO2_MIN",   "float", 50,   95,   5,    0, 80,
+             "SpO2 values below this threshold are rejected as implausible.\n"
+             "Healthy anaesthetised animal: ≥ 95%"),
+            ("Decim Ratio",         "DECIM_RATIO","int",   1,    4,    1,    0, 1,
+             "Software decimation before the Maxim SpO2 algorithm (1, 2, or 4).\n"
+             "1 = no decimation (recommended). Higher values slow SpO2 updates."),
         ],
         "Sensor Setup": [
-            ("LED Brightness",  "LED",       "int",   10,   255,  10,   0, 80,    ""),
-            ("ADC Range",       "ADC_RANGE", "int",   2048, 16384,2048, 0, 16384, ""),
-            ("Sample Average",  "SAMPLE_AVG","int",   1,    32,   1,    0, 4,     ""),
+            ("LED Brightness",      "LED",        "int",   10,   255,  10,   0, 80,
+             "MAX30102 LED drive current (raw value 0–255, not a percentage).\n"
+             "Target IR raw ≈ 50 000–130 000 counts. Verify in the waveform plot.\n"
+             "Human fingertip: 80 | Rodent paw/tail: start at 40"),
+            ("ADC Range",           "ADC_RANGE",  "int",   2048, 16384,2048, 0, 16384,
+             "MAX30102 photodetector ADC full-scale (2048 / 4096 / 8192 / 16384 nA).\n"
+             "Larger range = higher saturation threshold.\n"
+             "Human: 16384 | Rodent thin tissue: try 4096"),
+            ("Sample Average",      "SAMPLE_AVG", "int",   1,    32,   1,    0, 4,
+             "Hardware averaging per FIFO entry (1 / 2 / 4 / 8 / 16 / 32).\n"
+             "Effective FIFO rate = 400 Hz ÷ Sample Average.\n"
+             "Default 4 → 100 Hz. Reduce to 1 if HR detection fails on rodents."),
         ],
-        "Piezo / Resp Rate": [
-            ("Calib Min Swing", "CALIB_SWING","int",  20,   400,  10,   0, 120,   "counts"),
-            ("Insp Threshold",  "THRESH_INSP","float",0.40, 0.85, 0.05, 2, 0.65,  ""),
-            ("Exp Threshold",   "THRESH_EXP", "float",0.20, 0.70, 0.05, 2, 0.45,  ""),
+        "Respiratory Rate": [
+            ("Calib Min Swing (mV)", "CALIB_SWING","float", 50,   1950, 50,   0, 586,
+             "Minimum respiratory sensor signal swing (mV) for calibration to be valid.\n"
+             "Decrease for animals with shallow breathing. Increase in noisy environments.\n"
+             "586 mV ≈ 120 ADC counts (10-bit, 5 V reference)  |  Sensor-independent."),
+            ("Insp Threshold",      "THRESH_INSP","float", 0.40, 0.85, 0.05, 2, 0.65,
+             "Schmitt trigger upper threshold — fraction of the signal envelope\n"
+             "at which an inspiration event is detected (0.0–1.0).\n"
+             "Must be > Exp Threshold + 0.05. Default: 0.65"),
+            ("Exp Threshold",       "THRESH_EXP", "float", 0.20, 0.70, 0.05, 2, 0.45,
+             "Schmitt trigger lower threshold — fraction of the signal envelope\n"
+             "at which the detector resets after an inspiration (0.0–1.0).\n"
+             "The gap (Insp − Exp) determines noise rejection. Default: 0.45"),
         ],
         "Temperature": [
-            ("Temp Min",        "TEMP_MIN",  "float", 20,   35,   1,    1, 30,    "deg C"),
-            ("Temp Max",        "TEMP_MAX",  "float", 35,   50,   1,    1, 45,    "deg C"),
+            ("Temp Min (°C)",       "TEMP_MIN",   "float", 20,   35,   1,    1, 30,
+             "Readings below this are treated as probe disconnected or shorted.\n"
+             "Normal rodent rectal temperature: 36.5–38.5 °C"),
+            ("Temp Max (°C)",       "TEMP_MAX",   "float", 35,   50,   1,    1, 45,
+             "Readings above this are treated as probe open circuit.\n"
+             "Normal rodent rectal temperature: 36.5–38.5 °C"),
         ],
     }
 
@@ -418,7 +477,7 @@ class SettingsDialog(QDialog):
             group = QGroupBox(group_name)
             grid  = QGridLayout(group)
             grid.setColumnStretch(1, 1)
-            for row, (label, key, wtype, mn, mx, step, dec, default, unit) in enumerate(params):
+            for row, (label, key, wtype, mn, mx, step, dec, default, tooltip) in enumerate(params):
                 cached = self.cache.get(key, default)
                 if wtype == "int":
                     spin = QSpinBox()
@@ -431,11 +490,15 @@ class SettingsDialog(QDialog):
                     spin.setSingleStep(float(step))
                     spin.setDecimals(dec)
                     spin.setValue(float(cached))
-                if unit:
-                    spin.setSuffix(f"  {unit}")
+                # No suffix — units are shown in the label (in parentheses).
+                if tooltip:
+                    spin.setToolTip(tooltip)
                 self.widgets[key] = spin
-                grid.addWidget(QLabel(label), row, 0)
-                grid.addWidget(spin,          row, 1)
+                lbl = QLabel(label)
+                if tooltip:
+                    lbl.setToolTip(tooltip)
+                grid.addWidget(lbl,  row, 0)
+                grid.addWidget(spin, row, 1)
             main_layout.addWidget(group)
 
         self.lbl_status = QLabel("")
@@ -495,11 +558,17 @@ class SettingsDialog(QDialog):
         self._send_next()
 
     def _send_next(self):
-        """Send the next command from _send_queue, if any remain."""
+        """Send the next command from _send_queue, if any remain.
+
+        CALIB_SWING is displayed and edited in mV but the Arduino expects
+        counts (10-bit ADC, 5 V reference). Convert before sending.
+        """
         if not hasattr(self, '_send_queue') or not self._send_queue:
             return
         key, val = self._send_queue.pop(0)
-        self.thread.send({"cmd": "set", "key": key, "val": val})
+        # mV → counts conversion for CALIB_SWING only.
+        send_val = round(val / _ADC_MV) if key == "CALIB_SWING" else val
+        self.thread.send({"cmd": "set", "key": key, "val": send_val})
 
     def on_ack(self, resp):
         """
@@ -513,7 +582,9 @@ class SettingsDialog(QDialog):
         key = resp.get('ack') if ok else resp.get('nak', '?')
 
         if ok and self.daq and key in self.widgets:
-            # Cache the widget value so reopening the dialog shows current state.
+            # Update cache with the widget value (already in display units).
+            # For CALIB_SWING, the widget holds mV — consistent with _on_data()
+            # which also converts the Arduino counts→mV before caching.
             self.daq.param_cache[key] = self.widgets[key].value()
 
         if key in self._pending:
@@ -594,8 +665,10 @@ class PyVitalSignsDAQ(QMainWindow):
         # Three parallel lists of length max_points (oldest discarded on append).
         self._PLOT_WARMUP = 150
         self.max_points = 300           # ~3 s of history at 100 Hz
-        self.ir_data    = [0] * self.max_points
-        self.pz_data    = [0] * self.max_points
+        self.ir_data     = [0] * self.max_points
+        self.pz_data     = [0] * self.max_points
+        self.pz_raw_data = [0] * self.max_points   # raw mV before DC removal
+        self._pz_dc      = None   # IIR DC baseline estimate; set on first packet
         # ts_data: Arduino timestamps (ms) for the X axis.
         # Initialised to a 10 ms ramp so pyqtgraph has valid X before first packet.
         self.ts_data    = list(range(0, self.max_points * 10, 10))
@@ -652,14 +725,26 @@ class PyVitalSignsDAQ(QMainWindow):
             "font-weight: bold; border: none; border-radius: 4px;")
         self.btn_fft.setEnabled(False)
         self.btn_fft.setToolTip("Open live Power Spectral Density viewer\n"
-                                "(IR-PPG red, Piezo gold)")
+                                "(IR-PPG red, Respiratory gold)")
         self.btn_fft.clicked.connect(self.open_fft)
+
+        self.btn_tare = QPushButton("Resp. Tare")
+        self.btn_tare.setStyleSheet(
+            "background-color: #333; color: #aaa; padding: 8px; "
+            "font-weight: bold; border: none; border-radius: 4px;")
+        self.btn_tare.setEnabled(False)
+        self.btn_tare.setToolTip(
+            "Zero the respiratory sensor baseline.\n"
+            "Place the animal on the sensor first, then click.\n"
+            "The resting offset is subtracted immediately so only\n"
+            "respiratory variations are displayed.")
+        self.btn_tare.clicked.connect(self.resp_tare)
 
         self.lbl_init_msg = QLabel("")
         self.lbl_init_msg.setStyleSheet(
             "color: #cccccc; font-size: 16px; font-weight: bold; margin-left: 30px;")
 
-        self.btn_event = QPushButton("⚡ MARK EVENT")
+        self.btn_event = QPushButton("MARK EVENT")
         self.btn_event.setStyleSheet(
             "background-color: #555; color: #aaa; padding: 8px; "
             "font-weight: bold; border: none; border-radius: 4px;")
@@ -687,6 +772,7 @@ class PyVitalSignsDAQ(QMainWindow):
         top_bar.addWidget(self.btn_connect)
         top_bar.addWidget(self.btn_settings)
         top_bar.addWidget(self.btn_fft)
+        top_bar.addWidget(self.btn_tare)
         top_bar.addWidget(self.lbl_init_msg)
         top_bar.addStretch()
         top_bar.addWidget(self.btn_event)
@@ -714,20 +800,21 @@ class PyVitalSignsDAQ(QMainWindow):
         # IR-PPG chart: X axis is Arduino timestamp for true temporal alignment.
         self.plot_ir = pg.PlotWidget(
             title='<span style="color:#b30000;font-size:11pt;font-weight:bold;">'
-                  'PPG — IR Optical (MAX30102)</span>')
+                  'Photoplethysmography</span>')
         self.plot_ir.setBackground('#0d0d0d')
         self.plot_ir.showGrid(x=True, y=True, alpha=0.2)
-        self.plot_ir.getAxis('bottom').setLabel('Time (ms, Arduino clock)')
+        self.plot_ir.getAxis('bottom').setLabel('Time (ms)') # Arduino clock
         self.curve_ir = self.plot_ir.plot(pen=pg.mkPen('#b30000', width=2))
         charts_layout.addWidget(self.plot_ir)
 
         # Piezo chart: linked X axis — panning/zooming one moves both.
         self.plot_pz = pg.PlotWidget(
             title='<span style="color:#cca300;font-size:11pt;font-weight:bold;">'
-                  'RESP — Piezo Belt</span>')
+                  'Respiratory Excursions</span>')
         self.plot_pz.setBackground('#0d0d0d')
         self.plot_pz.showGrid(x=True, y=True, alpha=0.2)
-        self.plot_pz.getAxis('bottom').setLabel('Time (ms, Arduino clock)')
+        self.plot_pz.getAxis('bottom').setLabel('Time (ms)') # Arduino clock
+        self.plot_pz.getAxis('left').setLabel('mV')
         self.curve_pz = self.plot_pz.plot(pen=pg.mkPen('#cca300', width=2))
         self.plot_pz.setXLink(self.plot_ir)
         charts_layout.addWidget(self.plot_pz)
@@ -802,6 +889,10 @@ class PyVitalSignsDAQ(QMainWindow):
             self.btn_fft.setStyleSheet(
                 "background-color: #1a3a1a; color: #6c6; padding: 8px; "
                 "font-weight: bold; border: none; border-radius: 4px;")
+            self.btn_tare.setEnabled(True)
+            self.btn_tare.setStyleSheet(
+                "background-color: #2a2a1a; color: #cc4; padding: 8px; "
+                "font-weight: bold; border: none; border-radius: 4px;")
         else:
             self.serial_thread.stop()
             self.serial_thread = None
@@ -818,6 +909,10 @@ class PyVitalSignsDAQ(QMainWindow):
                 "font-weight: bold; border: none; border-radius: 4px;")
             self.btn_fft.setEnabled(False)
             self.btn_fft.setStyleSheet(
+                "background-color: #333; color: #aaa; padding: 8px; "
+                "font-weight: bold; border: none; border-radius: 4px;")
+            self.btn_tare.setEnabled(False)
+            self.btn_tare.setStyleSheet(
                 "background-color: #333; color: #aaa; padding: 8px; "
                 "font-weight: bold; border: none; border-radius: 4px;")
             if self.fft_dlg and self.fft_dlg.isVisible():
@@ -843,9 +938,36 @@ class PyVitalSignsDAQ(QMainWindow):
         self.lbl_init_msg.setText("")
         print(f"Serial error: {err_msg}")
 
-    # ─────────────────────────────────────────────────────────────────────────
-    # SETTINGS
-    # ─────────────────────────────────────────────────────────────────────────
+    def resp_tare(self):
+        """
+        Tare (zero) the respiratory sensor baseline immediately.
+
+        Sets the IIR DC estimate (_pz_dc) to the mean of the last 50 raw
+        sensor samples, cancelling the resting offset instantly
+        instead of waiting for the IIR filter to converge (~200 s).
+
+        Workflow:
+          1. Place the animal on the sensor.
+          2. Wait 2–3 s for the signal to stabilise.
+          3. Click Resp. Tare.
+          4. The waveform recentres: only respiratory oscillations remain.
+
+        The tare value is session-only — it resets if the application is
+        restarted or the connection is toggled.
+        """
+        # pz_raw_data holds the raw mV values before DC removal and inversion.
+        recent = [v for v in self.pz_raw_data[-50:] if v != 0]
+        if len(recent) < 10:
+            return   # Not enough data yet — ignore silently.
+        self._pz_dc = sum(recent) / len(recent)
+
+        # Visual feedback: button flashes green briefly.
+        self.btn_tare.setStyleSheet(
+            "background-color: #006600; color: #fff; padding: 8px; "
+            "font-weight: bold; border: none; border-radius: 4px;")
+        QTimer.singleShot(800, lambda: self.btn_tare.setStyleSheet(
+            "background-color: #2a2a1a; color: #cc4; padding: 8px; "
+            "font-weight: bold; border: none; border-radius: 4px;"))
 
     def open_fft(self):
         """
@@ -860,6 +982,10 @@ class PyVitalSignsDAQ(QMainWindow):
         else:
             self.fft_dlg.raise_()
             self.fft_dlg.activateWindow()
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # SETTINGS
+    # ─────────────────────────────────────────────────────────────────────────
 
     def open_settings(self):
         """
@@ -939,7 +1065,7 @@ class PyVitalSignsDAQ(QMainWindow):
                     'RespRate_RPM', 'Temperature_C', 'Event_Marker'])
                 self.csv_raw.writerow([
                     'Time_Seconds', 'TS_Arduino_ms',
-                    'IR_Raw', 'Piezo_Raw', 'Event_Marker'])
+                    'IR_Raw', 'Resp_mV', 'Event_Marker'])
 
                 self.start_time        = time.time()
                 self.ts_origin_arduino = None
@@ -1016,7 +1142,12 @@ class PyVitalSignsDAQ(QMainWindow):
             # Covers both {"cmd":"set"} ACKs and {"cmd":"get"} responses.
             key = data.get('ack')
             if key and 'val' in data:
-                self.param_cache[key] = data['val']
+                val_cached = data['val']
+                # CALIB_SWING is stored in counts on the Arduino;
+                # convert to mV for display in the Settings panel.
+                if key == 'CALIB_SWING':
+                    val_cached = round(val_cached * _ADC_MV, 1)
+                self.param_cache[key] = val_cached
             # Forward to open Settings dialog for status label update.
             if self.settings_dlg is not None:
                 self.settings_dlg.on_ack(data)
@@ -1030,13 +1161,22 @@ class PyVitalSignsDAQ(QMainWindow):
         Steps per packet:
           1. Clear "Initializing..." label on first arrival.
           2. Extract fields; apply defaults for missing keys.
+          2b. Respiratory sensor signal conditioning:
+              - Convert counts → mV (10-bit ADC, 5 V reference).
+              - IIR low-pass (α=0.005 @ 100 Hz, fc≈0.08 Hz) tracks slow
+                DC baseline (animal weight, posture drift, ~200 s time const).
+              - Invert AC component so inspiratory peaks are positive.
+              - Shift signal upward by DC estimate so it stays positive at rest.
+              - Resp. Tare forces immediate convergence of the DC estimate.
           3. Extract and validate the "ts" timestamp.
           4. Update numeric readout labels.
           5. Append to waveform buffers; discard oldest sample.
           6. Redraw both waveform curves with real-time X axis.
-          7. Update visible X range (plot_pz follows via XLink).
+          7. Update visible X range (respiratory plot follows IR via XLink).
           8. Prune event lines that have scrolled out of view.
           9. If recording: write one row to each CSV file.
+             Resp_mV column contains the processed (conditioned) signal,
+             matching exactly what is displayed on screen.
         """
         # Step 1
         if self.lbl_init_msg.text():
@@ -1051,7 +1191,26 @@ class PyVitalSignsDAQ(QMainWindow):
         rr = data.get('rr', 0)
         t  = data.get('t',  0)
         ir = data.get('ir', 0)
-        pz = data.get('pz', 0)
+        pz_raw = data.get('pz', 0) * _ADC_MV   # counts → mV (10-bit, 5 V ref)
+
+        # Store raw mV in a separate buffer used by piezo_tare().
+        self.pz_raw_data.append(pz_raw)
+        self.pz_raw_data.pop(0)
+
+        # ── Piezo signal conditioning ─────────────────────────────────────────
+        # FSR406 / inverted piezo: inspiration increases pressure → resistance
+        # drops → ADC voltage drops → raw signal goes DOWN on inspiration.
+        # Steps:
+        #   1. IIR low-pass (α=0.005 @ 100 Hz → fc≈0.08 Hz) tracks slow DC
+        #      baseline (weight of animal, posture drift). Time constant ~200 s.
+        #   2. AC = DC_estimate − raw  →  inspiration becomes a positive peak.
+        #   3. Shift upward by DC_estimate so signal stays positive at rest.
+        if self._pz_dc is None:
+            self._pz_dc = pz_raw   # initialise on first packet
+        self._pz_dc += 0.005 * (pz_raw - self._pz_dc)
+        # Apply inversion based on sensor type (see _INVERT_RESP above).
+        pz_ac = (self._pz_dc - pz_raw) if _INVERT_RESP else (pz_raw - self._pz_dc)
+        pz    = pz_ac + self._pz_dc
 
         # Step 3 — "ts" is Arduino capture time; fall back to +10 ms increment
         # for firmware without the ts field (maintains display without alignment).
