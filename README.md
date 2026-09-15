@@ -300,7 +300,7 @@ Arduino library dependencies (install via Arduino IDE Library Manager):
 
 ## Known Limitations
 
-- HR and SpO2 values are not validated against a calibrated reference instrument. For research use only.
+- HR and SpO2 values are not validated against a calibrated reference instrument.
 - SpO2 may read 100% consistently when DECIM_RATIO = 1 — increase to 4 via Settings if this occurs.
 - The `_debug_serial()` diagnostic output is plain text and incompatible with the Python DAQ. Use only with the Arduino IDE Serial Monitor when the Python application is not connected.
 - If the USB cable is disconnected during a recording session, the CSV files may be incomplete. Always stop recording before disconnecting.
