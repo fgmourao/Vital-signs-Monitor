@@ -83,6 +83,7 @@ extern uint8_t  g_DECIM_RATIO;
 extern uint8_t  g_LED_BRIGHTNESS;
 extern uint8_t  g_SAMPLE_AVERAGE;
 extern uint32_t g_ADC_RANGE;
+extern uint16_t g_PULSE_WIDTH;
 extern int      g_CALIB_MIN_SWING;
 extern float    g_THRESH_INSP_FRAC;
 extern float    g_THRESH_EXP_FRAC;
@@ -139,6 +140,7 @@ static void _send_all_params()
     _send_ack_val("LED",         (float)g_LED_BRIGHTNESS);
     _send_ack_val("ADC_RANGE",   (float)g_ADC_RANGE);
     _send_ack_val("SAMPLE_AVG",  (float)g_SAMPLE_AVERAGE);
+    _send_ack_val("PULSE_WIDTH", (float)g_PULSE_WIDTH);
     _send_ack_val("CALIB_SWING", (float)g_CALIB_MIN_SWING);
     _send_ack_val("THRESH_INSP", g_THRESH_INSP_FRAC);
     _send_ack_val("THRESH_EXP",  g_THRESH_EXP_FRAC);

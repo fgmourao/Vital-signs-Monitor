@@ -417,6 +417,11 @@ class SettingsDialog(QDialog):
              "Hardware averaging per FIFO entry (1 / 2 / 4 / 8 / 16 / 32).\n"
              "Effective FIFO rate = 400 Hz ÷ Sample Average.\n"
              "Default 4 → 100 Hz. Reduce to 1 if HR detection fails on rodents."),
+            ("Pulse Width (µs)",    "PULSE_WIDTH","int",   69,   411,  1,    0, 215,
+             "LED pulse width per ADC conversion (69 / 118 / 215 / 411 µs).\n"
+             "Longer = higher SNR and ADC resolution but more power consumption.\n"
+             "For rodent thin tissue with weak AC signal, try 411 µs.\n"
+             "Valid values snap to nearest: 69, 118, 215, 411."),
         ],
         "Respiratory Rate": [
             ("Calib Min Swing (mV)", "CALIB_SWING","float", 50,   1950, 50,   0, 586,

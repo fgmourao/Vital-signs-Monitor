@@ -115,7 +115,8 @@
 //    Addr 15  : g_LED_BRIGHTNESS  (uint8_t, 1 byte)
 //    Addr 16  : g_SAMPLE_AVERAGE  (uint8_t, 1 byte)
 //    Addr 17–20: g_ADC_RANGE      (uint32_t, 4 bytes)
-//    Addr 21–24: g_CALIB_MIN_SWING (int, 4 bytes)  [written by monitor_set_param]
+//    Addr 21–22: g_PULSE_WIDTH    (uint16_t, 2 bytes)
+//    Addr 23–26: g_CALIB_MIN_SWING (int, 4 bytes)  [written by monitor_set_param]
 //    Addr 25–28: g_THRESH_INSP_FRAC (float, 4 bytes)
 //    Addr 29–32: g_THRESH_EXP_FRAC  (float, 4 bytes)
 //    Addr 33–36: g_TEMP_MIN_C       (float, 4 bytes)
@@ -126,7 +127,7 @@
 //  for laboratory use.
 // ═══════════════════════════════════════════════════════════════════════════════
 
-static const uint8_t  EEPROM_MAGIC      = 0xA5;
+static const uint8_t  EEPROM_MAGIC      = 0xA6;   // bumped: added g_PULSE_WIDTH to layout
 static const uint16_t EEPROM_ADDR_MAGIC = 0;
 static const uint16_t EEPROM_ADDR_DATA  = 1;
 
@@ -151,6 +152,7 @@ void eeprom_save_all()
     EEPROM.put(addr, g_LED_BRIGHTNESS);  addr += sizeof(g_LED_BRIGHTNESS);
     EEPROM.put(addr, g_SAMPLE_AVERAGE);  addr += sizeof(g_SAMPLE_AVERAGE);
     EEPROM.put(addr, g_ADC_RANGE);       addr += sizeof(g_ADC_RANGE);
+    EEPROM.put(addr, g_PULSE_WIDTH);     addr += sizeof(g_PULSE_WIDTH);
     EEPROM.put(addr, g_CALIB_MIN_SWING); addr += sizeof(g_CALIB_MIN_SWING);
     EEPROM.put(addr, g_THRESH_INSP_FRAC);addr += sizeof(g_THRESH_INSP_FRAC);
     EEPROM.put(addr, g_THRESH_EXP_FRAC); addr += sizeof(g_THRESH_EXP_FRAC);
@@ -173,6 +175,7 @@ bool eeprom_load_all()
     EEPROM.get(addr, g_LED_BRIGHTNESS);  addr += sizeof(g_LED_BRIGHTNESS);
     EEPROM.get(addr, g_SAMPLE_AVERAGE);  addr += sizeof(g_SAMPLE_AVERAGE);
     EEPROM.get(addr, g_ADC_RANGE);       addr += sizeof(g_ADC_RANGE);
+    EEPROM.get(addr, g_PULSE_WIDTH);     addr += sizeof(g_PULSE_WIDTH);
     EEPROM.get(addr, g_CALIB_MIN_SWING); addr += sizeof(g_CALIB_MIN_SWING);
     EEPROM.get(addr, g_THRESH_INSP_FRAC);addr += sizeof(g_THRESH_INSP_FRAC);
     EEPROM.get(addr, g_THRESH_EXP_FRAC); addr += sizeof(g_THRESH_EXP_FRAC);
@@ -282,12 +285,13 @@ int spO2      = 0;   // %,   0 = no valid data
 uint8_t  g_LED_BRIGHTNESS = 80;
 uint8_t  g_SAMPLE_AVERAGE = 4;
 uint32_t g_ADC_RANGE      = 16384;
+uint16_t g_PULSE_WIDTH    = 215;    // Valid values: 69, 118, 215, 411 µs
 
 
 // ════════════════════════════════════════════════════════════════════════════
 //  max30102_apply_sensor_config()
 //  Re-runs particleSensor.setup() with current g_* values.
-//  Called by max30102_set_param() when LED, ADC_RANGE or SAMPLE_AVERAGE change.
+//  Called by max30102_set_param() when LED, ADC_RANGE, SAMPLE_AVERAGE or PULSE_WIDTH change.
 // ════════════════════════════════════════════════════════════════════════════
 
 static void max30102_apply_sensor_config()
@@ -297,7 +301,7 @@ static void max30102_apply_sensor_config()
         g_SAMPLE_AVERAGE,
         2,      // Red + IR (fixed)
         400,    // internal sample rate (fixed)
-        215,    // pulse width us (fixed)
+        g_PULSE_WIDTH,  // pulse width µs — set in max30102_set_param()
         g_ADC_RANGE
     );
     Wire.setClock(400000UL);
@@ -333,6 +337,12 @@ bool max30102_set_param(const String& key, float value)
     else if (key == "SAMPLE_AVG"){
         uint8_t s = (uint8_t)constrain(value, 1.0f, 32.0f);
         g_SAMPLE_AVERAGE = (s<=1)?1:(s<=2)?2:(s<=4)?4:(s<=8)?8:(s<=16)?16:32;
+        sensorChanged = true;
+    }
+    else if (key == "PULSE_WIDTH") {
+        // Valid values: 69, 118, 215, 411 µs. Clamp to nearest valid.
+        uint16_t pw = (uint16_t)value;
+        g_PULSE_WIDTH = (pw <= 69) ? 69 : (pw <= 118) ? 118 : (pw <= 215) ? 215 : 411;
         sensorChanged = true;
     }
     else { return false; }
@@ -383,7 +393,8 @@ bool max30102_init()
     Serial.print(F("  LED="));   Serial.print(g_LED_BRIGHTNESS);
     Serial.print(F(" | avg="));  Serial.print(g_SAMPLE_AVERAGE);
     Serial.print(F(" | adc="));  Serial.print(g_ADC_RANGE);
-    Serial.print(F(" | decim=")); Serial.println(g_DECIM_RATIO);
+    Serial.print(F(" | decim=")); Serial.print(g_DECIM_RATIO);
+    Serial.print(F(" | pw="));   Serial.print(g_PULSE_WIDTH); Serial.println(F("us"));
     Serial.println(F("  Place sensor on fingertip and hold steady..."));
     Serial.println(F("  IR > 50000 = good contact | IR < 5000 = no contact"));
     Serial.println(F("========================================"));

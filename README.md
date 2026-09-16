@@ -105,7 +105,7 @@ EEPROM layout (ATmega2560, 4 KB available):
 
 | Addr | Variable | Type | Bytes |
 |---|---|---|---|
-| 0 | Magic byte (0xA5) | uint8_t | 1 |
+| 0 | Magic byte (0xA6) | uint8_t | 1 |
 | 1 | g_HR_MIN_BPM | float | 4 |
 | 5 | g_HR_MAX_BPM | float | 4 |
 | 9 | g_HR_OUTLIER_FRAC | float | 4 |
@@ -114,11 +114,12 @@ EEPROM layout (ATmega2560, 4 KB available):
 | 15 | g_LED_BRIGHTNESS | uint8_t | 1 |
 | 16 | g_SAMPLE_AVERAGE | uint8_t | 1 |
 | 17 | g_ADC_RANGE | uint32_t | 4 |
-| 21 | g_CALIB_MIN_SWING | int | 4 |
-| 25 | g_THRESH_INSP_FRAC | float | 4 |
-| 29 | g_THRESH_EXP_FRAC | float | 4 |
-| 33 | g_TEMP_MIN_C | float | 4 |
-| 37 | g_TEMP_MAX_C | float | 4 |
+| 21 | g_PULSE_WIDTH | uint16_t | 2 |
+| 23 | g_CALIB_MIN_SWING | int | 4 |
+| 27 | g_THRESH_INSP_FRAC | float | 4 |
+| 31 | g_THRESH_EXP_FRAC | float | 4 |
+| 35 | g_TEMP_MIN_C | float | 4 |
+| 39 | g_TEMP_MAX_C | float | 4 |
 
 ---
 
@@ -154,6 +155,7 @@ Inbound — read all parameters:
 | `LED` | g_LED_BRIGHTNESS | MAX30102 | LED drive current (1–255) — reruns sensor setup |
 | `ADC_RANGE` | g_ADC_RANGE | MAX30102 | ADC full-scale (2048/4096/8192/16384) — reruns setup |
 | `SAMPLE_AVG` | g_SAMPLE_AVERAGE | MAX30102 | Hardware averaging per FIFO entry — reruns setup |
+| `PULSE_WIDTH` | g_PULSE_WIDTH | MAX30102 | LED pulse width (69/118/215/411 µs) — reruns setup |
 | `CALIB_SWING` | g_CALIB_MIN_SWING | monitor | Minimum respiratory sensor swing (mV) for valid calibration |
 | `THRESH_INSP` | g_THRESH_INSP_FRAC | monitor | Inspiration threshold fraction (0.40–0.85) |
 | `THRESH_EXP` | g_THRESH_EXP_FRAC | monitor | Expiration threshold fraction (0.20–0.70) |
@@ -244,6 +246,7 @@ The system is compatible with two sensor types connected to A0 via a voltage div
 | LED Brightness | 80 | 40–60 | 20–40 |
 | ADC Range | 16384 | 4096 | 2048–4096 |
 | Sample Average | 4 | 1–4 | 1–2 |
+| Pulse Width | 215 µs | 215–411 µs | 215–411 µs |
 
 Target IR raw DC level: 50,000–130,000 counts (20–50% of ADC full-scale). Verify in the waveform plot after positioning the sensor.
 
@@ -262,6 +265,12 @@ The SparkFun `checkForBeat()` detector was calibrated for unaveraged signals. Wi
 
 **[T4] IIR DC baseline convergence**
 The respiratory signal DC filter has a time constant of ~200 s at 100 Hz. When the animal is first placed on the sensor, the display may appear shifted until the filter converges. Use **Resp. Tare** to force immediate convergence.
+
+**[T5] SparkFun library internal buffer — STORAGE_SIZE**
+The SparkFun MAX3010x library uses an internal ring buffer (`STORAGE_SIZE`) to hold FIFO data between `check()` calls. The default value of 4 samples causes silent data loss whenever `loop()` is delayed beyond ~40 ms (e.g. by the OLED display task), producing irregular sample spacing in `irBuffer[]` and `redBuffer[]`. This distorts the Maxim FIR filters and typically causes SpO2 to read 100% or HR to be erratic. This project set `STORAGE_SIZE = 64` by editing `MAX30105.h` at `~/Documents/Arduino/libraries/SparkFun_MAX3010x_Sensor_Library/src/MAX30105.h`
+
+**[T6] SpO2 reference values**
+The Maxim `spo2_algorithm` lookup table was calibrated for adult human fingertip measurements. In anaesthetised rodents, SpO2 values of 88–95% have been reported in the literature. If the monitor reads 99–100% during rodent anaesthesia, this may reflect algorithm miscalibration (next steps...)
 
 ---
 
@@ -292,16 +301,33 @@ The respiratory signal DC filter has a time constant of ~200 s at 100 Hz. When t
 | `fft_vitalsigns.py` | Live PSD viewer — Welch method for HR and respiratory spectral analysis |
 
 Arduino library dependencies (install via Arduino IDE Library Manager):
-- **SparkFun MAX3010x Pulse and Proximity Sensor Library**
+- **SparkFun MAX3010x Pulse and Proximity Sensor Library** ⚠️ requires manual modification (see [T5])
 - **U8g2** (Oliver Kraus)
 - **WebSockets** (Markus Sattler) — ESP8266 only
+
+### Library Configuration
+
+The SparkFun MAX3010x library requires one manual edit before compiling:
+
+**File:** `~/Documents/Arduino/libraries/SparkFun_MAX3010x_Sensor_Library/src/MAX30105.h`
+
+Locate and change:
+```cpp
+#define STORAGE_SIZE 4
+```
+to:
+```cpp
+#define STORAGE_SIZE 64  // required — default of 4 causes silent sample loss
+```
+
+This setting controls the size of the library's internal ring buffer. With the default of 4, any `loop()` delay beyond ~40 ms silently discards samples before they reach the HR and SpO2 algorithms, causing SpO2 to read 100% and HR to be erratic. See [T5] for the technical explanation.
 
 ---
 
 ## Known Limitations
 
 - HR and SpO2 values are not validated against a calibrated reference instrument.
-- SpO2 may read 100% consistently when DECIM_RATIO = 1 — increase to 4 via Settings if this occurs.
+- SpO2 may read 100% consistently if `DECIM_RATIO = 1` (increase to 4 via Settings) or if the SparkFun library `STORAGE_SIZE` is not set to 64 (see [T5]).
 - The `_debug_serial()` diagnostic output is plain text and incompatible with the Python DAQ. Use only with the Arduino IDE Serial Monitor when the Python application is not connected.
 - If the USB cable is disconnected during a recording session, the CSV files may be incomplete. Always stop recording before disconnecting.
 - Primary Wi-Fi client assignment is first-connect order. If a secondary workstation connects before the primary, it will receive 25 Hz instead of 100 Hz.
