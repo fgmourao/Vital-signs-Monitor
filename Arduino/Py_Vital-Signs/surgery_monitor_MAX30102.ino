@@ -1,8 +1,9 @@
 /**
  * @file    surgery_monitor_MAX30102.ino
- * PROJECT: Vital-signs monitor — small rodents (rat / mouse)
+ * PROJECT: Vital-signs monitor
  * @version 1.0
  * @author  Flávio Mourão — Mar, 2026
+ * @updated Oct, 2026
  *
  * ═══════════════════════════════════════════════════════════════════════════════
  * MODULE RESPONSIBILITY
@@ -32,14 +33,35 @@
  *                         │                                     │
  *                         │  PATH 2 — SpO2                      │
  *                         │  Software decimation x1             │
- *                         │  (g_DECIM_RATIO = 1, no extra avg)    │
+ *                         │  (g_DECIM_RATIO = 1, no extra avg)  │
  *                         │  → irBuffer[100] + redBuffer[100]   │
  *                         │  → maxim_heart_rate_and_oxygen_sat  │
  *                         │    (Sparkfun / Maxim algorithm)     │
  *                         │    sliding window: retain 75,       │
- *                         │    refill 25, update every 1 s      │
- *                         │    → spO2 (%)                       │
+ *                         │    refill 25 → update every 25      │
+ *                         │    samples (0.25 s at 100 Hz)       │
+ *                         │    → spO2 (%), last valid value     │
+ *                         │      held up to SPO2_TIMEOUT_MS     │
  *                         └─────────────────────────────────────┘
+ *
+ * ═══════════════════════════════════════════════════════════════════════════════
+ * BEAT TIMING — SAMPLE INDEX, NOT millis()
+ * ═══════════════════════════════════════════════════════════════════════════════
+ * The MAX30102 produces samples on its own oscillator while loop() may read
+ * several of them per call. Time-stamping a burst with one millis() value would
+ * quantise beat intervals to the loop period. Beat interval =
+ * (samples between beats) x g_samplePeriodMs, where the period starts at the
+ * nominal 2.5 ms x sampleAverage and is re-measured every >= 4 s as
+ * (elapsed ms) / (samples consumed); windows outside 0.85-1.15 x nominal are
+ * ignored. On contact loss (IR < 5000) all HR/SpO2 state is reset. Without
+ * contact loss, heartRate is cleared after HR_TIMEOUT_MS (5 s) without an
+ * accepted beat and spO2 after SPO2_TIMEOUT_MS (10 s) without a valid block, so
+ * a stale value is never shown (e.g. when the AC amplitude leaves the 20-1000
+ * gate of checkForBeat and no beat is accepted).
+ * Every filter below is per sample and assumes the nominal FIFO rate: a wrong
+ * rate (e.g. 16 Hz from a slow loop, or 50 Hz from sampleAverage = 8 left in
+ * EEPROM) makes heart-rate and SpO2 results meaningless. The boot message
+ * prints avg / adc / LED / pw; check it first when results look wrong.
  *
  * ═══════════════════════════════════════════════════════════════════════════════
  * KNOWN DESIGN TRADEOFFS — HUMAN VS RODENT
@@ -61,28 +83,53 @@
  *   set g_DECIM_RATIO=4, and verify that heartRate detection still functions
  *   (checkForBeat() was calibrated for high-amplitude raw signals).
  *
- * [T2] checkForBeat() with hardware-averaged signal
- *   The SparkFun checkForBeat() derivative-based detector was designed for
- *   unaveraged signals at higher amplitude. With sampleAverage=4 the AC
- *   component reaching checkForBeat() is already smoothed. This reduces
- *   detection sensitivity, particularly for the weaker pulsatile signal
- *   expected from rodent tail or paw sites.
+ * [T2] checkForBeat() — what it really does, and its limits for rodents
+ *   Chain (heartRate.cpp): IIR DC estimate (alpha 1/16) subtracted from the
+ *   input, 23-tap symmetric FIR low-pass (>>15), rising zero-crossing detector.
+ *   A beat is accepted only if the AC peak-to-peak of the previous cycle is
+ *   between 21 and 999 counts (gate 20 < pk-pk < 1000).
  *
- *   If HR detection fails on rodents: lower sampleAverage to 1 in init(),
- *   which restores full AC amplitude at 400 Hz. Adjust g_HR_MIN_BPM and
- *   g_HR_MAX_BPM to the rodent physiological window before doing this.
+ *   Frequency response at 100 Hz (computed from the coefficients):
+ *     DC estimator high-pass corner ~1.0 Hz
+ *     FIR gain relative to DC: 1 Hz 0.96 | 2 Hz 0.86 | 4 Hz 0.53 | 5 Hz 0.36 |
+ *                              6 Hz 0.22 | 7 Hz 0.11 | 8 Hz 0.04 | >= 10 Hz 0
+ *     -3 dB at ~3 Hz, group delay 110 ms.
+ *   Human HR (1-3 Hz) passes well. A rat (300-500 BPM = 5-8 Hz) is attenuated
+ *   to 4-36 % and a mouse (250-800 BPM = 4-13 Hz) even more, so the AC may fall
+ *   below the gate or the zero-crossings become unreliable. Both ends of the
+ *   filter scale with the FIFO rate (sampleAverage 2 -> corners x2, 1 -> x4;
+ *   the DC high-pass corner at 400 Hz is ~4 Hz and starts to cut a 5 Hz
+ *   cardiac wave), so there is no sampleAverage setting that fits a rat
+ *   well. If HR detection fails on rodents, a detector with a band-pass of
+ *   ~3.5-12 Hz and an adaptive threshold (alt_hr_detector.m) is the intended
+ *   replacement; verify offline with emulate_firmware_hr.m on a rodent record.
  *
- * [T3] adcRange = 16384 required for human finger
+ *   Human bench validation (finger, LED 80, ADC 16384, avg 4, 100 Hz): IR DC
+ *   ~145000, AC 280-560 counts pk-pk; 95 of 97 reference beats detected, median
+ *   HR within 1-3 BPM of a zero-phase offline reference.
+ *
+ * [T3] adcRange = 16384 required for human finger (current EEPROM/default)
  *   With LED=80 on a human fingertip, adcRange=4096 saturates the ADC
  *   (IR DC reaches 262143 = 18-bit hardware ceiling). adcRange=16384 prevents
  *   saturation. For rodents (thinner tissue, less absorption) adcRange=4096
  *   or even 2048 may be appropriate — verify with IR_raw diagnostic output.
  *
  * [T4] Physiological filter range
- *   g_HR_MIN_BPM and g_HR_MAX_BPM are currently set for human bench testing.
- *   Must be changed to rodent values before animal use:
+ *   g_HR_MIN_BPM (40) and g_HR_MAX_BPM (800) are currently set for human bench
+ *   testing; change them in the Python Settings panel (saved to EEPROM) before
+ *   animal use:
  *     Rat:   HR_MIN=200, HR_MAX=500
  *     Mouse: HR_MIN=250, HR_MAX=800
+ *
+ * ═══════════════════════════════════════════════════════════════════════════════
+ * DEBUG AIDS  (all off by default)
+ * ═══════════════════════════════════════════════════════════════════════════════
+ *   DEBUG_SERIAL = 1      1 Hz plain-text status line (IR, contact, HR, SpO2)
+ *                         and the HR auto-reset message. Text on Serial0 is
+ *                         ignored by the Python DAQ but is not valid JSON:
+ *                         use only with the Arduino Serial Monitor.
+ *   PLOTTER_ENABLE = true raw IR counts for the Arduino Serial Plotter
+ *                         (mutually exclusive with the text and the JSON stream).
  *
  * ═══════════════════════════════════════════════════════════════════════════════
  * SRAM BUDGET  [MEGA 2560 only — DO NOT enable on Uno/Nano]
@@ -106,32 +153,47 @@
 //  firmware loads saved values from EEPROM instead of using compile-time defaults.
 //
 //  Layout (ATmega2560 has 4 KB EEPROM):
-//    Addr 0   : magic byte (0xA5) — confirms EEPROM has been written at least once
-//    Addr 1–4 : g_HR_MIN_BPM      (float, 4 bytes)
-//    Addr 5–8 : g_HR_MAX_BPM      (float, 4 bytes)
-//    Addr 9–12: g_HR_OUTLIER_FRAC (float, 4 bytes)
-//    Addr 13  : g_SPO2_MIN_VALID  (uint8_t, 1 byte)
-//    Addr 14  : g_DECIM_RATIO     (uint8_t, 1 byte)
-//    Addr 15  : g_LED_BRIGHTNESS  (uint8_t, 1 byte)
-//    Addr 16  : g_SAMPLE_AVERAGE  (uint8_t, 1 byte)
-//    Addr 17–20: g_ADC_RANGE      (uint32_t, 4 bytes)
-//    Addr 21–22: g_PULSE_WIDTH    (uint16_t, 2 bytes)
-//    Addr 23–26: g_CALIB_MIN_SWING (int, 4 bytes)  [written by monitor_set_param]
+//    Addr 0    : magic byte (0xA6) — confirms EEPROM has been written at least once
+//    Addr 1–4  : g_HR_MIN_BPM       (float, 4 bytes)
+//    Addr 5–8  : g_HR_MAX_BPM       (float, 4 bytes)
+//    Addr 9–12 : g_HR_OUTLIER_FRAC  (float, 4 bytes)
+//    Addr 13   : g_SPO2_MIN_VALID   (uint8_t, 1 byte)
+//    Addr 14   : g_DECIM_RATIO      (uint8_t, 1 byte)
+//    Addr 15   : g_LED_BRIGHTNESS   (uint8_t, 1 byte)
+//    Addr 16   : g_SAMPLE_AVERAGE   (uint8_t, 1 byte)
+//    Addr 17–20: g_ADC_RANGE        (uint32_t, 4 bytes)
+//    Addr 21–22: g_PULSE_WIDTH      (uint16_t, 2 bytes)
+//    Addr 23–24: g_CALIB_MIN_SWING  (int, 2 bytes on AVR)  [owned by monitor_set_param]
 //    Addr 25–28: g_THRESH_INSP_FRAC (float, 4 bytes)
 //    Addr 29–32: g_THRESH_EXP_FRAC  (float, 4 bytes)
 //    Addr 33–36: g_TEMP_MIN_C       (float, 4 bytes)
 //    Addr 37–40: g_TEMP_MAX_C       (float, 4 bytes)
+//  Addresses are computed with sizeof() in eeprom_save_all()/eeprom_load_all();
+//  any change to the order or types needs a new EEPROM_MAGIC.
+//  A wrong value saved here (e.g. sampleAverage = 8) survives power cycles and
+//  changes the FIFO rate: always check the boot line "LED | avg | adc | decim | pw".
 //
 //  EEPROM endurance: 100,000 write cycles per address. With EEPROM.put() using
 //  update-only writes (skips unchanged bytes), this is effectively unlimited
 //  for laboratory use.
 // ═══════════════════════════════════════════════════════════════════════════════
 
-static const uint8_t  EEPROM_MAGIC      = 0xA6;   // bumped: added g_PULSE_WIDTH to layout
+static const uint8_t  EEPROM_MAGIC      = 0xA6;   // bumped when g_PULSE_WIDTH was added to the layout
 static const uint16_t EEPROM_ADDR_MAGIC = 0;
 static const uint16_t EEPROM_ADDR_DATA  = 1;
 
-// Forward declarations for piezo/temp variables owned by surgery_monitor.ino
+// Forward declarations (order-independent of the .ino concatenation): the
+// MAX30102 parameters defined further down, and the piezo/temp variables
+// owned by surgery_monitor.ino.
+extern float    g_HR_MIN_BPM;
+extern float    g_HR_MAX_BPM;
+extern float    g_HR_OUTLIER_FRAC;
+extern uint8_t  g_SPO2_MIN_VALID;
+extern uint8_t  g_DECIM_RATIO;
+extern uint8_t  g_LED_BRIGHTNESS;
+extern uint8_t  g_SAMPLE_AVERAGE;
+extern uint32_t g_ADC_RANGE;
+extern uint16_t g_PULSE_WIDTH;
 extern int   g_CALIB_MIN_SWING;
 extern float g_THRESH_INSP_FRAC;
 extern float g_THRESH_EXP_FRAC;
@@ -191,6 +253,11 @@ bool eeprom_load_all()
 
 MAX30105 particleSensor;
 
+// Debug text on Serial0 (see DEBUG AIDS in the header). Keep 0 with the Python DAQ.
+#ifndef DEBUG_SERIAL
+#define DEBUG_SERIAL 0
+#endif
+
 
 // ═══════════════════════════════════════════════════════════════════════════════
 //  PHYSIOLOGICAL CONSTANTS
@@ -242,6 +309,10 @@ uint8_t g_DECIM_RATIO    = 1;    // Mutable — updated by monitor_set_param()
 // Larger N → smoother but slower to respond to genuine rate changes.
 static const uint8_t HR_RING_SIZE = 6;
 
+// Values that are not refreshed are cleared instead of being held forever.
+static const uint32_t HR_TIMEOUT_MS   = 5000;    // no accepted beat -> heartRate = 0
+static const uint32_t SPO2_TIMEOUT_MS = 10000;   // no valid SpO2 block -> spO2 = 0
+
 // SpO2 block: fixed at 100 by the Maxim algorithm. Do not change.
 static const uint8_t SPO2_BLOCK   = 100;
 
@@ -271,7 +342,20 @@ static float         hrRates[HR_RING_SIZE];
 static uint8_t       hrSpot        = 0;
 static uint8_t       hrFill        = 0;        // Valid entries (0 to HR_RING_SIZE)
 static uint8_t       hrRejectCount = 0;        // Consecutive outlier rejections
-static unsigned long lastBeatMs    = 0;
+static uint32_t      lastAcceptedIdx  = 0;      // sample index of the last accepted beat
+static uint32_t      lastSpo2OkIdx    = 0;      // sample index of the last valid SpO2 block
+
+// Beat timing is based on the FIFO SAMPLE INDEX, not on millis(). The MAX30102
+// produces samples on its own hardware clock, while loop() may read them in
+// bursts (several samples per call). Time-stamping a burst with one millis()
+// value would quantise beat intervals to the loop period; counting samples
+// does not. Interval (ms) = samples between beats x measured sample period.
+static uint32_t      lastBeatIdx      = 0;      // sample index of previous beat / last no-contact sample
+static uint32_t      sampleCount      = 0;      // FIFO samples consumed since boot
+static float         g_samplePeriodMs = 10.0f;  // FIFO sample period (ms); measured at run time
+static bool          ratePrimed       = false;  // rate-measurement window started
+static unsigned long rateT0           = 0;      // millis() at window start
+static uint32_t      rateN0           = 0;      // sampleCount at window start
 
 // Last IR raw value — used by _debug_serial() for contact diagnostics
 static uint32_t irRawLast = 0;
@@ -305,6 +389,11 @@ static void max30102_apply_sensor_config()
         g_ADC_RANGE
     );
     Wire.setClock(400000UL);
+
+    // New sensor configuration → new FIFO rate (400 Hz / sampleAverage).
+    // Restart the run-time measurement of the sample period from nominal.
+    g_samplePeriodMs = 2.5f * (float)g_SAMPLE_AVERAGE;
+    ratePrimed       = false;
 }
 
 
@@ -405,18 +494,20 @@ bool max30102_init()
 // ═══════════════════════════════════════════════════════════════════════════════
 //  _process_beat()
 //  Called per detected beat event from max30102_update().
-//  nowMs: millis() snapshot from the current update() call.
+//  sampleIdx: running FIFO sample index of the sample that triggered the beat.
+//  The beat interval is (sample count between beats) x (measured sample
+//  period), independent of when loop() happened to read the FIFO.
 // ═══════════════════════════════════════════════════════════════════════════════
 
-static void _process_beat(unsigned long nowMs)
+static void _process_beat(uint32_t sampleIdx)
 {
-    const unsigned long delta = nowMs - lastBeatMs;
-    lastBeatMs = nowMs;
+    const uint32_t deltaSamples = sampleIdx - lastBeatIdx;
+    lastBeatIdx = sampleIdx;
 
     // First beat after reset: no interval available yet.
-    if (delta == 0) return;
+    if (deltaSamples == 0) return;
 
-    const float bpm = 60000.0f / (float)delta;
+    const float bpm = 60000.0f / ((float)deltaSamples * g_samplePeriodMs);
 
     // Physiological gate: reject beats outside the expected range.
     // This is the primary defence against double-detection and motion artefacts.
@@ -440,13 +531,17 @@ static void _process_beat(unsigned long nowMs)
                 hrFill        = 0;
                 hrSpot        = 0;
                 hrRejectCount = 0;
+#if DEBUG_SERIAL
                 Serial.println(F("[HR] Auto-reset: sustained rate shift detected."));
+#endif
             }
             return;
         }
     }
 
     hrRejectCount = 0;
+
+    lastAcceptedIdx = sampleIdx;
 
     // Write to ring buffer (circular, overwrites oldest entry when full).
     hrRates[hrSpot] = bpm;
@@ -492,6 +587,7 @@ static void _process_spo2_block()
         tempSpO2 <= SPO2_MAX_VALID)
     {
         spO2 = (int)tempSpO2;
+        lastSpo2OkIdx = sampleCount;
     }
 
     // Slide the window: shift the last SPO2_KEEP (75) samples to the start,
@@ -512,7 +608,7 @@ static void _process_spo2_block()
 //
 //  ACTIVATION
 //  Set PLOTTER_ENABLE = true  → Serial Plotter (raw IR counts, one per sample)
-//  Set PLOTTER_ENABLE = false → Serial Monitor (1 Hz diagnostic text)
+//  Set PLOTTER_ENABLE = false → normal operation (JSON stream; text only with DEBUG_SERIAL = 1)
 //  The two modes are mutually exclusive — they share the same UART.
 //
 //  HOW TO USE
@@ -554,7 +650,7 @@ static void _plot_serial(uint32_t irRaw)
 // ═══════════════════════════════════════════════════════════════════════════════
 //  _debug_serial()
 //  Prints one diagnostic line per second to Serial Monitor.
-//  Suppressed automatically when PLOTTER_ENABLE = true.
+//  Compiled only with DEBUG_SERIAL = 1; suppressed when PLOTTER_ENABLE = true.
 //
 //  OUTPUT FORMAT (plain text — use only without Python DAQ connected):
 //    IR=XXXXX [status]  HR=XXXbpm  SpO2=XX%
@@ -572,6 +668,7 @@ static void _plot_serial(uint32_t irRaw)
 //  Recalibrate thresholds after first animal measurements.
 // ═══════════════════════════════════════════════════════════════════════════════
 
+#if DEBUG_SERIAL
 static void _debug_serial()
 {
     // Suppressed when Serial Plotter is active — text labels corrupt CSV parsing.
@@ -618,6 +715,7 @@ static void _debug_serial()
 
     Serial.println();
 }
+#endif
 
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -631,7 +729,8 @@ static void _debug_serial()
 //         b. PATH 1: checkForBeat(irRaw) → _process_beat() if beat detected
 //         c. PATH 2: accumulate sample → write to SpO2 buffer when decimated
 //                    → _process_spo2_block() when buffer full
-//    3. _debug_serial() — print 1 Hz diagnostic line
+//    3. FIFO sample-period measurement (every >= 4 s)
+//    4. _debug_serial() — 1 Hz diagnostic line (only with DEBUG_SERIAL = 1)
 //
 //  PATH 1 and PATH 2 are fully independent: a beat detection event does not
 //  affect SpO2 buffer accumulation and vice versa.
@@ -639,8 +738,6 @@ static void _debug_serial()
 
 void max30102_update()
 {
-    const unsigned long nowMs = millis();
-
     particleSensor.check();
 
     while (particleSensor.available())
@@ -648,6 +745,7 @@ void max30102_update()
         const uint32_t redRaw = particleSensor.getFIFORed();
         const uint32_t irRaw  = particleSensor.getFIFOIR();
         particleSensor.nextSample();
+        sampleCount++;       // Every FIFO sample is counted, contact or not.
 
         irRawLast = irRaw;   // Store for debug output.
 
@@ -665,7 +763,7 @@ void max30102_update()
             decimCount  = 0;
             sumRed      = 0;
             sumIR       = 0;
-            lastBeatMs  = millis();
+            lastBeatIdx = sampleCount;
             continue;
         }
 
@@ -677,7 +775,7 @@ void max30102_update()
         // a DC-removal pre-filter may be required (see tradeoff [T2]).
         // checkForBeat() result used only for _process_beat — no state stored.
         if (checkForBeat(irRaw)) {
-            _process_beat(nowMs);
+            _process_beat(sampleCount);
         }
 
         // Serial Plotter — sends raw IR count. No-op when PLOTTER_ENABLE = false.
@@ -706,8 +804,46 @@ void max30102_update()
         }
     }
 
-    // 1 Hz diagnostic — Serial Monitor only. Disable when Python DAQ is active.
+    // Timeouts: a value that stopped being refreshed must not stay on screen.
+    if (heartRate > 0 &&
+        (float)(sampleCount - lastAcceptedIdx) * g_samplePeriodMs > (float)HR_TIMEOUT_MS) {
+        heartRate     = 0;
+        hrFill        = 0;
+        hrSpot        = 0;
+        hrRejectCount = 0;
+    }
+    if (spO2 > 0 &&
+        (float)(sampleCount - lastSpo2OkIdx) * g_samplePeriodMs > (float)SPO2_TIMEOUT_MS) {
+        spO2 = 0;
+    }
+
+    // ── FIFO sample-period measurement ────────────────────────────────────────
+    // The MAX30102 samples from its internal oscillator, the Arduino from its
+    // crystal; their ratio is not exactly nominal. Every >= 4 s, the real
+    // period is estimated as (elapsed ms) / (samples consumed). Windows with
+    // implausible results (sensor absent, FIFO overflow) are ignored.
+    {
+        const unsigned long tEnd = millis();
+        if (!ratePrimed) {
+            ratePrimed = true;
+            rateT0     = tEnd;
+            rateN0     = sampleCount;
+        } else if (tEnd - rateT0 >= 4000UL) {
+            const uint32_t n = sampleCount - rateN0;
+            if (n >= 20) {
+                const float p       = (float)(tEnd - rateT0) / (float)n;
+                const float nominal = 2.5f * (float)g_SAMPLE_AVERAGE;
+                if (p > 0.85f * nominal && p < 1.15f * nominal) g_samplePeriodMs = p;
+            }
+            rateT0 = tEnd;
+            rateN0 = sampleCount;
+        }
+    }
+
+    // 1 Hz diagnostic — Serial Monitor only (DEBUG_SERIAL = 1). Not valid JSON.
+#if DEBUG_SERIAL
     _debug_serial();
+#endif
 }
 
 

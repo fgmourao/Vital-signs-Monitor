@@ -4,49 +4,76 @@ Py_VitalSigns_DAQ.py
 PROJECT : Vital-signs monitor
 VERSION : 1.0
 AUTHOR  : Flávio Mourão — Mar, 2026
-Last update : Sep, 2026
+Last update : Oct, 2026
 
 ════════════════════════════════════════════════════════════════════════════════
 MODULE RESPONSIBILITY
 ════════════════════════════════════════════════════════════════════════════════
 Standalone USB data-acquisition and real-time display application for the
 rodent vital-signs monitor. Receives a 100 Hz JSON stream from the ATmega2560
-over USB-Serial and provides:
+(Py_Vital-Signs.ino) over USB-Serial and provides:
 
-  - Real-time scrolling waveform display (IR-PPG and respiratory sensor waveform)
+  - Scrolling waveforms (~3 s): IR-PPG and respiratory sensor
   - Numeric readouts: HR, SpO2, respiratory rate, core temperature
-  - Intra-session event marking with visual timeline markers on both waveforms
-  - CSV recording split into two files:
+  - Event markers on both waveforms (while recording)
+  - CSV recording in two files:
       *_vitals.csv — low-rate physiological values, wall-clock time axis
-      *_raw.csv    — high-rate raw waveform samples, Arduino timestamp axis
-  - Settings panel for runtime parameter adjustment via bidirectional Serial
-    protocol — no recompilation required
-  - Resp. Tare button for instant respiratory sensor baseline zeroing
-  - Live PSD viewer (FFT) for heart rate and respiratory rate spectral analysis
+      *_raw.csv    — high-rate waveform samples, Arduino timestamp axis
+  - Settings panel: runtime parameter adjustment over the bidirectional serial
+    protocol, no recompilation required
+  - Resp. Tare: instant zeroing of the respiratory baseline
+  - Live PSD viewer (fft_vitalsigns.py) for heart-rate and respiratory-rate
+    spectral analysis, fed by a ~60 s history
+  - IR display filter (visual analysis only): Remove DC, configurable causal
+    band-pass (HP / LP corners) and a "checkForBeat view" showing the signal as
+    the firmware beat detector sees it. The PSD follows the displayed signal.
+    CSV files always store the raw, unfiltered IR counts.
 
 ════════════════════════════════════════════════════════════════════════════════
-TEMPORAL ALIGNMENT ARCHITECTURE
+TIME BASE
 ════════════════════════════════════════════════════════════════════════════════
-The firmware produces two signals with fundamentally different time domains:
+Every packet carries "ts" (ATmega2560 millis() at serialisation), the common
+time axis of both signals; the PC clock is not used for signal analysis.
 
-  Resp. sensor (pz): captured by TIMER1_COMPA_vect — hardware ISR at exactly 100 Hz,
-              fully deterministic.
+  Resp. sensor (pz): 100 Hz Timer1 ISR (moving average of 4), latest value
+                     read at serialisation.
+  IR (ir):           latest MAX30102 FIFO sample (100 Hz for sample average 4),
+                     read in loop(). When loop() is late a sample can repeat
+                     (~10 % of packets) or be skipped; use the CSV for
+                     morphology and rate, not for sample-exact timing.
 
-  IR (ir):    read from the MAX30102 FIFO inside loop() — cooperative
-              scheduling, subject to ±1–5 ms jitter.
+Packets leave the Arduino every 10–13 ms. The PSD viewer therefore receives a
+history linearly interpolated onto a uniform grid at the mean packet period
+(Welch assumes uniform sampling). A time gap > 100 ms, a backwards "ts" (Arduino
+reset on reconnect) or a Settings pause restarts that history.
 
-Both signals are packed into the same JSON packet. The firmware includes a
-"ts" field (ATmega2560 millis()) used as the common X-axis for both signals,
-eliminating USB transport jitter from the recorded waveforms.
+All firmware filters (checkForBeat, SpO2) run per sample and assume the nominal
+FIFO rate (400 Hz / sample average). The measured rate is shown next to the IR
+filter controls ("fs ≈ N Hz"); a value far below 100 Hz makes the display
+filter and any offline analysis meaningless.
+
+════════════════════════════════════════════════════════════════════════════════
+RESPIRATORY CONDITIONING  (Resp_mV)
+════════════════════════════════════════════════════════════════════════════════
+  1. counts -> mV (10-bit ADC, 5 V reference, 1 count ≈ 4.89 mV)
+  2. slow IIR DC estimate (alpha 0.005 @ 100 Hz, fc ≈ 0.08 Hz, ~200 s)
+  3. AC = DC - raw (_INVERT_RESP = True, FSR406: inspiration lowers the ADC
+     value) or raw - DC (False), so inspiration is a positive deflection
+  4. DC added back, so the trace stays positive at rest
+  Resp. Tare sets the DC estimate to the mean of the last 50 samples
+  (session-only).
 
 ════════════════════════════════════════════════════════════════════════════════
 SETTINGS WORKFLOW
 ════════════════════════════════════════════════════════════════════════════════
-Parameter changes are applied in real time via Serial:
-  1. Click Settings → adjust values → click Send to Arduino.
-  2. Arduino receives each command, applies immediately, and confirms with ACK.
-  3. Parameters are saved to EEPROM on the Arduino — survive power cycles.
-  4. On connect, Python sends {"cmd":"get"} to read current Arduino values.
+  1. Settings -> adjust values -> Send to Arduino (display pauses meanwhile).
+  2. Parameters are sent one at a time; each is applied and confirmed by ACK
+     before the next one. CALIB_SWING is edited in mV and sent in ADC counts.
+  3. Values are stored in the Arduino EEPROM and survive power cycles.
+  4. On connect (after 1.5 s) Python sends {"cmd":"get"} to read the current
+     firmware values into the Settings panel.
+  Changing LED, ADC range, sample average or pulse width reconfigures the
+  sensor (new FIFO rate and signal level).
 
 ════════════════════════════════════════════════════════════════════════════════
 JSON PACKET FORMAT  (defined in Py_Vital-Signs.ino)
@@ -54,20 +81,22 @@ JSON PACKET FORMAT  (defined in Py_Vital-Signs.ino)
   {"hr":NNN,"sp":NNN,"rr":NNN,"pz":NNN,"t":NN.N,"ir":NNNNNN,"ts":NNNNNN}
 
   hr  — heart rate (BPM, int). 0 = no valid signal.
-  sp  — SpO2 (%, int). 0 = no valid signal.
+  sp  — SpO2 (%, int). 0 = no valid signal; holds the last valid value.
   rr  — respiratory rate (rpm, int). 0 = apnoea or no signal.
   pz  — respiratory sensor ADC value (10-bit counts, 0–1023).
-         Converted to mV and conditioned (DC removal + inversion) in Python
-         before display and CSV recording. See update_gui() Step 2b.
-  t   — core temperature (deg C, one decimal). 0 = probe disconnected.
-  ir  — raw IR photodetector count from MAX30102 (uint32, 0-262143).
-  ts  — ATmega2560 millis() at packet serialisation time (ms, uint32).
+  t   — core temperature (deg C, one decimal). 0 = probe disconnected or
+        outside the configured range.
+  ir  — raw IR photodetector count from MAX30102 (uint32, 0–262143).
+  ts  — ATmega2560 millis() at packet serialisation (ms, uint32).
 
-BIDIRECTIONAL PROTOCOL  (Python → Arduino, on demand)
-  Command: SOH(0x01) + {"cmd":"set","key":"KEY","val":VALUE} + newline
+BIDIRECTIONAL PROTOCOL  (Python -> Arduino, on demand)
+  Set:     SOH(0x01) + {"cmd":"set","key":"KEY","val":VALUE} + newline
   Get all: SOH(0x01) + {"cmd":"get"} + newline
   ACK:     {"ack":"KEY","val":APPLIED_VALUE}
   NAK:     {"nak":"reason"}
+  SOH makes the firmware suspend its outbound stream until the newline, so
+  replies never interleave with data packets. Lines that are not JSON objects
+  (boot text) are ignored.
 
 ════════════════════════════════════════════════════════════════════════════════
 CSV OUTPUT FORMAT
@@ -75,13 +104,17 @@ CSV OUTPUT FORMAT
   *_vitals.csv
     Time_Seconds, HeartRate_BPM, SpO2_%, RespRate_RPM, Temperature_C,
     Event_Marker
+    Time_Seconds is wall-clock time since REC start (PC clock).
 
   *_raw.csv
     Time_Seconds, TS_Arduino_ms, IR_Raw, Resp_mV, Event_Marker
-    USE TS_Arduino_ms (not Time_Seconds) as the time axis for signal analysis.
-    Resp_mV: respiratory sensor signal in millivolts. DC-baseline removed;
-             polarity corrected (_INVERT_RESP) so inspiratory peaks are positive.
-             Tare offset applied if Resp. Tare was clicked. NOT the raw ADC value.
+    Use TS_Arduino_ms (Arduino clock, zeroed at REC start), not Time_Seconds,
+    as the time axis for signal analysis.
+    IR_Raw: raw MAX30102 counts, never filtered.
+    Resp_mV: conditioned respiratory signal in mV (see above): polarity
+             corrected, DC level retained, tare applied if clicked.
+             NOT the raw ADC value.
+    Pausing stops logging; the next sample after a pause follows a time gap.
 
 ════════════════════════════════════════════════════════════════════════════════
 DEPENDENCIES
@@ -89,6 +122,8 @@ DEPENDENCIES
   pyserial   >= 3.5   — pip install pyserial
   PyQt5      >= 5.15  — pip install PyQt5
   pyqtgraph  >= 0.13  — pip install pyqtgraph
+  numpy, scipy        — filters and PSD
+  fft_vitalsigns.py   — PSD viewer, same folder
 
   Compatible with Spyder IDE: uses QApplication.instance() to avoid creating
   a second QApplication when IPython already manages one.
@@ -96,9 +131,8 @@ DEPENDENCIES
 ════════════════════════════════════════════════════════════════════════════════
 HARDWARE CONTEXT
 ════════════════════════════════════════════════════════════════════════════════
-  Board  : Mega+WiFi (ATmega2560 + ESP8266 on-board co-processor)
-  USB    : ATmega2560 USB-Serial bridge
-  Baud   : 115200
+  Board  : RobotDyn Mega+WiFi (ATmega2560 + ESP8266 co-processor)
+  USB    : ATmega2560 USB-Serial bridge, 115200 baud (must match the sketch)
   Stream : JSON lines at 100 Hz, terminated by newline
 """
 
@@ -107,36 +141,35 @@ import json
 import time
 import csv
 import queue
+from collections import deque
+import numpy as np
+from scipy.signal import butter, sosfilt, sosfilt_zi
 import serial
 import serial.tools.list_ports
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QPushButton, QFileDialog, QFrame, QComboBox,
     QDialog, QDoubleSpinBox, QSpinBox, QGroupBox, QGridLayout,
-    QLineEdit
+    QCheckBox, QTextBrowser
 )
+from PyQt5.QtGui import QTextOption
 from PyQt5.QtCore import QThread, QTimer, pyqtSignal, Qt
 import pyqtgraph as pg
 from fft_vitalsigns import FFTVitalSignsWindow
 
-# ADC conversion: 10-bit, 5 V reference → 1 count = 5000/1023 mV
-_ADC_MV = 5000.0 / 1023.0   # ≈ 4.8875 mV per count
+# 10-bit ADC, 5 V reference: 1 count = 5000/1023 mV
+_ADC_MV = 5000.0 / 1023.0
 
-# Respiratory sensor polarity:
-#
-#   FSR406 (pressure resistive sensor):
-#     Inspiration compresses the sensor → resistance drops → ADC voltage drops.
-#     Inversion required so inspiration appears as a positive peak.
-#     Set _INVERT_RESP = True.
-#
-#   Piezo film (piezoelectric sensor):
-#     Polarity depends on mounting orientation and circuit interface.
-#     If inspiration appears as a VALLEY in the raw signal → set True.
-#     If inspiration appears as a PEAK  in the raw signal → set False.
-#     DC tare is less critical: piezo film is inherently AC
-#     (no static charge accumulation, no animal-weight offset).
-#
-_INVERT_RESP = True   # change to False if sensor already delivers positive peaks
+# Respiratory polarity. True: inspiration lowers the raw ADC value (FSR406, or a
+# piezo mounted so that inspiration is a valley). False: raw peak = inspiration.
+_INVERT_RESP = True
+
+# IR display filter (never written to CSV)
+_IR_DC_FC_HZ     = 0.1    # "Remove DC" slow estimator corner
+_IR_FILT_ORDER   = 3      # Butterworth order of each band-pass section
+# SparkFun checkForBeat() 23-tap symmetric FIR (>>15)
+_FW_FIR_HALF     = [172, 321, 579, 927, 1360, 1858, 2390, 2916, 3391, 3768, 4012]
+_FW_FIR_TAPS     = np.array(_FW_FIR_HALF + [4096] + _FW_FIR_HALF[::-1], dtype=np.int64)
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -145,13 +178,9 @@ _INVERT_RESP = True   # change to False if sensor already delivers positive peak
 
 class SerialThread(QThread):
     """
-    Background QThread that owns the serial port exclusively.
-    Follows the same architecture as conditioning_setup_dark.py:
-      - All port access (read AND write) happens inside run(), in one thread.
-      - send(cmd_dict): called from any thread; places command in a thread-safe
-        queue. _drain_tx() writes it to the port inside run().
-      - data_received: emitted for every valid JSON line (data packets AND ACKs).
-        The Settings dialog connects to this signal to receive ACK responses.
+    Owns the serial port: all reads and writes happen in run(). send() is
+    thread-safe (queue). data_received is emitted for every valid JSON line
+    (data packets and ACK/NAK).
     """
 
     data_received    = pyqtSignal(dict)
@@ -166,32 +195,15 @@ class SerialThread(QThread):
         self._tx_queue = queue.Queue()
 
     def send(self, cmd_dict):
-        """
-        Queue a command for transmission. Safe to call from any thread.
-        Prefixes each command with SOH (0x01) to signal the Arduino to halt
-        its outbound 100 Hz stream before receiving the command bytes.
-        Protocol: SOH + JSON + newline
-        """
+        """Queue a command; prefixed with SOH so the firmware pauses its stream."""
         payload = '\x01' + json.dumps(cmd_dict, separators=(',', ':')) + '\n'
         self._tx_queue.put(payload)
 
     def _drain_tx(self):
         """
-        Write queued commands to the port. Called only from run().
-
-        Since _send_all() now sends one command at a time (waiting for ACK
-        before sending the next via on_ack → _send_next), the queue normally
-        holds at most one command at a time.
-
-        SOH protocol per command:
-          1. Send SOH byte (0x01) — Arduino halts outbound stream immediately.
-          2. Wait 60 ms — Arduino finishes any in-progress Serial.print() and
-             its UART TX buffer drains. Reset OS RX buffer to discard data
-             packets that arrived during the wait.
-          3. Send the JSON command bytes. Arduino processes and sends ACK.
-          4. ACK arrives via _read_lines() → data_received → _on_data → on_ack.
-          5. on_ack() calls _send_next() to enqueue the next command.
-          6. Arduino resumes 100 Hz stream after cmdInProgress clears.
+        Write queued commands. Per command: send SOH, wait 60 ms for the firmware
+        to finish its current packet, drop the packets received meanwhile, then
+        send the JSON body.
         """
         while not self._tx_queue.empty():
             try:
@@ -209,7 +221,7 @@ class SerialThread(QThread):
                 break
 
     def _read_lines(self):
-        """Read all available lines and emit data_received for valid JSON."""
+        """Emit data_received for every valid JSON line."""
         while self.ser.in_waiting > 0:
             raw = self.ser.readline()
             if not raw:
@@ -248,10 +260,7 @@ class SerialThread(QThread):
 # ════════════════════════════════════════════════════════════════════════════
 
 class HelpDialog(QDialog):
-    """
-    Reference panel describing each configurable parameter.
-    Opened from the Settings dialog via the Help button.
-    """
+    """Parameter reference, opened from the Settings dialog."""
 
     HELP_TEXT = """
 <style>
@@ -339,8 +348,6 @@ class HelpDialog(QDialog):
 
         layout = QVBoxLayout(self)
 
-        from PyQt5.QtGui import QTextOption
-        from PyQt5.QtWidgets import QTextBrowser
         browser = QTextBrowser()
         browser.setOpenExternalLinks(False)
         browser.setStyleSheet(
@@ -357,32 +364,18 @@ class HelpDialog(QDialog):
         layout.addWidget(btn_close, alignment=Qt.AlignRight)
 
 
-
 # ════════════════════════════════════════════════════════════════════════════
 # SETTINGS DIALOG
 # ════════════════════════════════════════════════════════════════════════════
 
 class SettingsDialog(QDialog):
     """
-    Runtime parameter configuration panel — sends parameters via Serial,
-    exactly like conditioning_setup_dark.py sends trial data to the DUE.
-
-    Workflow:
-      1. User adjusts values and clicks Send.
-      2. Dialog calls serial_thread.send({"cmd":"set","key":K,"val":V})
-         for each parameter — thread-safe via queue.Queue.
-      3. Arduino receives, applies, and responds with {"ack":K,"val":V}.
-      4. data_received signal routes the ACK back to on_ack(), which
-         updates the status label and the param_cache.
-
-    The DAQ stream (100 Hz data packets) continues during Send — the
-    serial thread reads and emits them normally. update_gui() in the main
-    window is paused (is_paused=True) so the display freezes, but no
-    data is lost and the port is never shared between threads.
+    Runtime parameter panel. Parameters are sent one at a time (the next after
+    the ACK of the previous). The data stream keeps being read while the dialog
+    is open; display updates are paused.
     """
-    
-    # Tuple format: (label, key, type, min, max, step, decimals, default, tooltip)
-    # Units are shown in the label (in parentheses) — spinner fields are unit-free.
+
+    # (label, key, type, min, max, step, decimals, default, tooltip)
 
     PARAMS = {
         "Heart Rate": [
@@ -532,22 +525,11 @@ class SettingsDialog(QDialog):
             self.lbl_status.setText("Not connected.")
 
     def _send_all(self):
-        """
-        Send parameters to the Arduino one at a time, waiting for each ACK
-        before sending the next command. This matches the pattern used in
-        conditioning_setup_dark.py and avoids UART buffer overflow.
-
-        Flow:
-          1. Build the ordered list of (key, val) pairs.
-          2. Send the first command via _send_next().
-          3. on_ack() calls _send_next() again after each confirmed ACK.
-          4. When the list is empty, re-enable the Send button.
-        """
+        """Send all parameters sequentially, each after the ACK of the previous one."""
         if self.thread is None or not self.thread.running:
             self.lbl_status.setText("Not connected.")
             return
 
-        # Build ordered queue of parameters to send
         self._send_queue = []
         for params in self.PARAMS.values():
             for row in params:
@@ -559,37 +541,22 @@ class SettingsDialog(QDialog):
         self.btn_send.setEnabled(False)
         self.lbl_status.setText("Sending...")
 
-        # Send the first command — subsequent ones triggered by on_ack()
         self._send_next()
 
     def _send_next(self):
-        """Send the next command from _send_queue, if any remain.
-
-        CALIB_SWING is displayed and edited in mV but the Arduino expects
-        counts (10-bit ADC, 5 V reference). Convert before sending.
-        """
+        """Send the next queued command. CALIB_SWING is edited in mV, sent in ADC counts."""
         if not hasattr(self, '_send_queue') or not self._send_queue:
             return
         key, val = self._send_queue.pop(0)
-        # mV → counts conversion for CALIB_SWING only.
         send_val = round(val / _ADC_MV) if key == "CALIB_SWING" else val
         self.thread.send({"cmd": "set", "key": key, "val": send_val})
 
     def on_ack(self, resp):
-        """
-        Called by the main window when an ACK/NAK arrives from the Arduino.
-        Updates the status label and param_cache for confirmed parameters.
-
-        resp contains either {"ack": key, "val": applied_value}
-                          or {"nak": reason}
-        """
+        """Handle an ACK/NAK: update status and cache, then send the next command."""
         ok  = 'ack' in resp
         key = resp.get('ack') if ok else resp.get('nak', '?')
 
         if ok and self.daq and key in self.widgets:
-            # Update cache with the widget value (already in display units).
-            # For CALIB_SWING, the widget holds mV — consistent with _on_data()
-            # which also converts the Arduino counts→mV before caching.
             self.daq.param_cache[key] = self.widgets[key].value()
 
         if key in self._pending:
@@ -600,13 +567,11 @@ class SettingsDialog(QDialog):
         self.lbl_status.setText(f"{current}  {symbol}{key}".strip())
 
         if self._pending:
-            # More commands waiting — send the next one now
             self._send_next()
         else:
             self.btn_send.setEnabled(True)
 
     def _open_help(self):
-        """Open the parameter reference dialog."""
         dlg = HelpDialog(parent=self)
         dlg.exec_()
 
@@ -615,8 +580,6 @@ class SettingsDialog(QDialog):
             self.daq.is_paused = False
 
     def _close(self):
-        # Always re-enable send button and clear pending state before closing,
-        # so the dialog can be closed even if ACKs never arrived.
         self._pending = []
         self.btn_send.setEnabled(True)
         self._resume_daq()
@@ -632,15 +595,7 @@ class SettingsDialog(QDialog):
 # ════════════════════════════════════════════════════════════════════════════
 
 class PyVitalSignsDAQ(QMainWindow):
-    """
-    Main application window. Owns the UI layout, the serial thread lifecycle,
-    waveform buffers, CSV writers, and the event marker system.
-
-    Layout:
-        Top bar      — port selector, connect, settings, event marker, pause, REC
-        Left sidebar — four numeric readout cards (HR, SpO2, RR, Temp)
-        Right area   — two stacked pyqtgraph PlotWidgets with linked X axes
-    """
+    """Main window: UI, serial thread lifecycle, waveform buffers, CSV writers, event markers."""
 
     def __init__(self):
         super().__init__()
@@ -660,43 +615,53 @@ class PyVitalSignsDAQ(QMainWindow):
         self.file_raw    = None
         self.start_time  = 0
 
-        # ── Timestamp alignment state ─────────────────────────────────────────
-        # ts_origin_arduino: "ts" value of the first packet after REC start.
-        # Used to normalise TS_Arduino_ms to 0 at the start of each session.
+        # Arduino "ts" of the first packet after REC start (zeroes TS_Arduino_ms)
         self.ts_origin_arduino = None
         self.ts_origin_wall    = None
 
-        # ── Waveform display buffers ──────────────────────────────────────────
-        # Three parallel lists of length max_points (oldest discarded on append).
+        # Display buffers (max_points long, oldest dropped on append)
         self._PLOT_WARMUP = 150
-        self.max_points = 300           # ~3 s of history at 100 Hz
+        self._buffer_fill = self._PLOT_WARMUP
+        self.max_points = 300           # ~3 s at 100 Hz
+        # Long history for the PSD (~60 s); the four deques are appended together:
+        #   fft_ts (ms) | fft_raw (raw IR) | fft_ir (IR as displayed) | fft_pz (mV)
+        self._FFT_BUF_N = 6000
+        self.fft_ts  = deque(maxlen=self._FFT_BUF_N)
+        self.fft_raw = deque(maxlen=self._FFT_BUF_N)
+        self.fft_ir  = deque(maxlen=self._FFT_BUF_N)
+        self.fft_pz  = deque(maxlen=self._FFT_BUF_N)
         self.ir_data     = [0] * self.max_points
         self.pz_data     = [0] * self.max_points
-        self.pz_raw_data = [0] * self.max_points   # raw mV before DC removal
-        self._pz_dc      = None   # IIR DC baseline estimate; set on first packet
-        # ts_data: Arduino timestamps (ms) for the X axis.
-        # Initialised to a 10 ms ramp so pyqtgraph has valid X before first packet.
+        self.pz_raw_data = [0] * self.max_points   # raw mV (used by Resp. Tare)
+        self._pz_dc      = None                    # DC estimate, set on first packet
+        # X axis: Arduino ts (ms); 10 ms placeholder ramp until packets arrive.
         self.ts_data    = list(range(0, self.max_points * 10, 10))
 
-        # ── Event marker state ────────────────────────────────────────────────
-        # Each entry is (InfiniteLine, ts_ms). Lines are pruned when their
-        # timestamp scrolls out of the visible ts_data window.
+        # Event markers: (InfiniteLine, ts_ms), pruned when scrolled out of view
         self.event_lines_ir = []
         self.event_lines_pz = []
 
-        # param_cache: {key: current firmware value}.
-        # Populated from Arduino via {"cmd":"get"} on connect.
+        # {key: firmware value}, filled by {"cmd":"get"} on connect
         self.param_cache = {}
 
         self.serial_thread = None
         self.settings_dlg  = None
         self.fft_dlg       = None
 
+        # IR display-filter state
+        self._ir_dirty   = True    # rebuild on the next packet
+        self._ir_sos     = None    # band-pass SOS (None = bypass)
+        self._ir_zi      = None
+        self._ir_dc      = None    # slow DC estimate
+        self._ir_fs      = 100.0   # sampling rate of the current design
+        self._ir_fs_cnt  = 0
+        self._fw_avg     = 0       # checkForBeat DC register
+        self._fw_buf     = deque([0] * 23, maxlen=23)
+        self._ir_init    = False
+
         self.init_ui()
 
-    # ─────────────────────────────────────────────────────────────────────────
-    # UI CONSTRUCTION
-    # ─────────────────────────────────────────────────────────────────────────
+    # ── UI ────────────────────────────────────────────────────────────────────
 
     def init_ui(self):
         central = QWidget()
@@ -790,7 +755,6 @@ class PyVitalSignsDAQ(QMainWindow):
         body_layout = QHBoxLayout()
         main_layout.addLayout(body_layout)
 
-        # Left sidebar — numeric readout cards
         sidebar = QVBoxLayout()
         sidebar.setContentsMargins(0, 0, 10, 0)
         self.val_hr   = self.create_box(sidebar, "Heart Rate",  "bpm", "#b30000")
@@ -799,26 +763,25 @@ class PyVitalSignsDAQ(QMainWindow):
         self.val_temp = self.create_box(sidebar, "Temperature", "deg C", "#800080")
         body_layout.addLayout(sidebar, stretch=1)
 
-        # Right area — waveform charts
         charts_layout = QVBoxLayout()
 
-        # IR-PPG chart: X axis is Arduino timestamp for true temporal alignment.
+        charts_layout.addLayout(self._build_ir_controls())
+
         self.plot_ir = pg.PlotWidget(
             title='<span style="color:#b30000;font-size:11pt;font-weight:bold;">'
                   'Photoplethysmography</span>')
         self.plot_ir.setBackground('#0d0d0d')
         self.plot_ir.showGrid(x=True, y=True, alpha=0.2)
-        self.plot_ir.getAxis('bottom').setLabel('Time (ms)') # Arduino clock
+        self.plot_ir.getAxis('bottom').setLabel('Time (ms)')
         self.curve_ir = self.plot_ir.plot(pen=pg.mkPen('#b30000', width=2))
         charts_layout.addWidget(self.plot_ir)
 
-        # Piezo chart: linked X axis — panning/zooming one moves both.
         self.plot_pz = pg.PlotWidget(
             title='<span style="color:#cca300;font-size:11pt;font-weight:bold;">'
                   'Respiratory Excursions</span>')
         self.plot_pz.setBackground('#0d0d0d')
         self.plot_pz.showGrid(x=True, y=True, alpha=0.2)
-        self.plot_pz.getAxis('bottom').setLabel('Time (ms)') # Arduino clock
+        self.plot_pz.getAxis('bottom').setLabel('Time (ms)')
         self.plot_pz.getAxis('left').setLabel('mV')
         self.curve_pz = self.plot_pz.plot(pen=pg.mkPen('#cca300', width=2))
         self.plot_pz.setXLink(self.plot_ir)
@@ -826,8 +789,206 @@ class PyVitalSignsDAQ(QMainWindow):
 
         body_layout.addLayout(charts_layout, stretch=4)
 
+    # ── IR display filter (visual only) ───────────────────────────────────────
+
+    def _build_ir_controls(self):
+        """Control bar above the IR plot. Processing is causal (sample by sample)."""
+        style = ("QCheckBox, QLabel { color:#cccccc; font-size:12px; }"
+                 "QDoubleSpinBox { background:#2a2a2a; color:#fff; "
+                 "border:1px solid #444; border-radius:3px; padding:2px; }")
+        box = QHBoxLayout()
+
+        self.chk_ir_dc = QCheckBox("Remove DC")
+        self.chk_ir_dc.setToolTip(
+            "Subtract the slow IR baseline (IIR, fc ≈ 0.1 Hz).\n"
+            "Respiratory and cardiac components are preserved.")
+
+        self.chk_ir_bp = QCheckBox("Band-pass")
+        self.chk_ir_bp.setToolTip(
+            "Causal Butterworth filter (3rd order per section).\n"
+            "HP = high-pass corner, LP = low-pass corner. 'off' = section bypassed.")
+
+        self.spin_ir_hp = QDoubleSpinBox()
+        self.spin_ir_hp.setRange(0.0, 20.0); self.spin_ir_hp.setSingleStep(0.5)
+        self.spin_ir_hp.setDecimals(1);      self.spin_ir_hp.setValue(3.5)
+        self.spin_ir_hp.setSpecialValueText("off")
+        self.spin_ir_hp.setToolTip("High-pass corner (Hz). Rat cardiac ≈ 4–9 Hz.")
+
+        self.spin_ir_lp = QDoubleSpinBox()
+        self.spin_ir_lp.setRange(0.0, 50.0); self.spin_ir_lp.setSingleStep(0.5)
+        self.spin_ir_lp.setDecimals(1);      self.spin_ir_lp.setValue(12.0)
+        self.spin_ir_lp.setSpecialValueText("off")
+        self.spin_ir_lp.setToolTip("Low-pass corner (Hz). Limited to 0.45 × fs.")
+
+        self.chk_ir_fw = QCheckBox("checkForBeat view")
+        self.chk_ir_fw.setToolTip(
+            "Shows the signal exactly as the firmware beat detector sees it:\n"
+            "DC estimator (α = 1/16) + 23-tap FIR low-pass (110 ms delay at 100 Hz).\n"
+            "Overrides the other controls. Rising zero crossings = beats.")
+
+        self.lbl_ir_filt = QLabel("")
+        self.lbl_ir_filt.setStyleSheet("color:#888; font-size:11px;")
+
+        for w in (self.chk_ir_dc, self.chk_ir_bp, self.spin_ir_hp,
+                  self.spin_ir_lp, self.chk_ir_fw):
+            w.setStyleSheet(style)
+        lbl_hp = QLabel("HP"); lbl_lp = QLabel("LP")
+        lbl_hz1 = QLabel("Hz"); lbl_hz2 = QLabel("Hz")
+        for l in (lbl_hp, lbl_lp, lbl_hz1, lbl_hz2):
+            l.setStyleSheet("color:#cccccc; font-size:12px;")
+
+        for w in (self.chk_ir_dc, self.chk_ir_bp, self.chk_ir_fw):
+            w.toggled.connect(self._on_ir_filter_changed)
+        for w in (self.spin_ir_hp, self.spin_ir_lp):
+            w.valueChanged.connect(self._on_ir_filter_changed)
+
+        box.addWidget(self.chk_ir_dc)
+        box.addSpacing(12)
+        box.addWidget(self.chk_ir_bp)
+        box.addWidget(lbl_hp); box.addWidget(self.spin_ir_hp); box.addWidget(lbl_hz1)
+        box.addWidget(lbl_lp); box.addWidget(self.spin_ir_lp); box.addWidget(lbl_hz2)
+        box.addSpacing(12)
+        box.addWidget(self.chk_ir_fw)
+        box.addSpacing(12)
+        box.addWidget(self.lbl_ir_filt)
+        box.addStretch()
+        return box
+
+    def _on_ir_filter_changed(self, *_):
+        """Disable controls overridden by the firmware view; flag a rebuild."""
+        fw = self.chk_ir_fw.isChecked()
+        for w in (self.chk_ir_dc, self.chk_ir_bp, self.spin_ir_hp, self.spin_ir_lp):
+            w.setEnabled(not fw)
+        self._ir_dirty = True
+        if self.is_paused:
+            self._rebuild_ir_view()
+
+    def _estimate_ir_fs(self):
+        """Mean sampling rate (Hz) of the last <=100 real packets; 100 if too few."""
+        if len(self.fft_ts) < 20:
+            return 100.0
+        n  = min(100, len(self.fft_ts))
+        ts = np.fromiter((self.fft_ts[i] for i in range(-n, 0)), float, n)
+        span = ts[-1] - ts[0]
+        return 1000.0 * (n - 1) / span if span > 0 else 100.0
+
+    def _fft_clear(self):
+        """Drop the long PSD history (time gap, reconnect, Settings pause)."""
+        self.fft_ts.clear(); self.fft_raw.clear()
+        self.fft_ir.clear(); self.fft_pz.clear()
+        self._reset_ir_state()
+
+    def get_fft_buffers(self):
+        """
+        (ts_ms, ir, pz) for the PSD viewer, linearly interpolated onto a uniform
+        grid at the mean packet period (Welch assumes uniform sampling). ir is the
+        signal as displayed. Falls back to the short display buffers until enough
+        packets exist.
+        """
+        n = len(self.fft_ts)
+        if n < 50:
+            return list(self.ts_data), list(self.ir_data), list(self.pz_data)
+        ts = np.fromiter(self.fft_ts, float, n)
+        ir = np.fromiter(self.fft_ir, float, n)
+        pz = np.fromiter(self.fft_pz, float, n)
+        span = ts[-1] - ts[0]
+        if span <= 0:
+            return list(self.ts_data), list(self.ir_data), list(self.pz_data)
+        dt = span / (n - 1)
+        tu = np.arange(ts[0], ts[-1] + 0.5 * dt, dt)
+        return (tu.tolist(),
+                np.interp(tu, ts, ir).tolist(),
+                np.interp(tu, ts, pz).tolist())
+
+    def _reset_ir_state(self):
+        """Forget filter memory; states re-initialise on the next sample."""
+        self._ir_init = False
+        self._ir_zi   = None
+        self._ir_dc   = None
+        self._fw_avg  = 0
+        self._fw_buf  = deque([0] * 23, maxlen=23)
+
+    def _design_ir_filter(self):
+        """Design the band-pass SOS from HP/LP at the measured fs (None = bypass)."""
+        self._ir_sos = None
+        self._ir_fs  = self._estimate_ir_fs()
+        fs  = self._ir_fs
+        msg = f"fs ≈ {fs:.0f} Hz"
+        if fs < 80:
+            msg += "  ⚠ low rate — timing unreliable"
+        if self.chk_ir_bp.isChecked() and not self.chk_ir_fw.isChecked():
+            hp  = self.spin_ir_hp.value()
+            lp  = self.spin_ir_lp.value()
+            lp  = min(lp, 0.45 * fs) if lp > 0 else 0.0
+            nyq = fs / 2.0
+            secs = []
+            if hp > 0 and lp > 0 and hp >= lp:
+                msg += "  ⚠ HP must be < LP"
+            else:
+                try:
+                    if hp > 0:
+                        secs.append(butter(_IR_FILT_ORDER, hp / nyq, 'highpass', output='sos'))
+                    if lp > 0:
+                        secs.append(butter(_IR_FILT_ORDER, lp / nyq, 'lowpass',  output='sos'))
+                except ValueError:
+                    secs = []
+            if secs:
+                self._ir_sos = np.vstack(secs)
+        self.lbl_ir_filt.setText(msg)
+
+    def _rebuild_ir_view(self):
+        """Redesign the filter and re-filter the whole raw history."""
+        self._ir_dirty = False
+        self._design_ir_filter()
+        self._reset_ir_state()
+        out = [self._process_ir(x) for x in self.fft_raw]
+        self.fft_ir = deque(out, maxlen=self._FFT_BUF_N)
+        tail = out[-self.max_points:]
+        self.ir_data = [0.0] * (self.max_points - len(tail)) + tail
+        fw = self.chk_ir_fw.isChecked()
+        ac = fw or self.chk_ir_dc.isChecked() or self._ir_sos is not None
+        self.plot_ir.getAxis('left').setLabel(
+            'counts (checkForBeat AC)' if fw else ('counts (AC)' if ac else 'counts'))
+        self.plot_ir.enableAutoRange(axis='y')
+        if self._buffer_fill >= self._PLOT_WARMUP:
+            self.curve_ir.setData(self.ts_data, self.ir_data)
+
+    def _process_ir(self, x):
+        """
+        Causal per-sample IR processing (display only).
+        checkForBeat view: IIR DC (alpha 1/16) -> x - DC -> 23-tap FIR >> 15, the
+        same integer arithmetic as the SparkFun library. Otherwise: optional slow
+        DC removal, then optional band-pass. States initialise from the first
+        non-zero sample.
+        """
+        if not self._ir_init:
+            if x <= 0:
+                return 0.0
+            self._ir_init = True
+            self._ir_dc   = float(x)
+            self._fw_avg  = int(x) << 15
+
+        if self.chk_ir_fw.isChecked():
+            xi = int(x)
+            self._fw_avg += ((xi << 15) - self._fw_avg) >> 4
+            self._fw_buf.append(xi - (self._fw_avg >> 15))
+            z = int(np.dot(_FW_FIR_TAPS, np.asarray(self._fw_buf, dtype=np.int64)))
+            return float(z >> 15)
+
+        v = float(x)
+        if self.chk_ir_dc.isChecked():
+            a = 1.0 - np.exp(-2.0 * np.pi * _IR_DC_FC_HZ / self._ir_fs)
+            self._ir_dc += a * (v - self._ir_dc)
+            v -= self._ir_dc
+        if self._ir_sos is not None:
+            if self._ir_zi is None:
+                self._ir_zi = sosfilt_zi(self._ir_sos) * v
+            out, self._ir_zi = sosfilt(self._ir_sos, [v], zi=self._ir_zi)
+            v = float(out[0])
+        return v
+
     def create_box(self, layout, title, unit, color):
-        """Build a numeric readout card and return the value QLabel."""
+        """Numeric readout card; returns the value QLabel."""
         frame = QFrame()
         frame.setStyleSheet(f"""
             QFrame {{
@@ -859,9 +1020,7 @@ class PyVitalSignsDAQ(QMainWindow):
         layout.addWidget(frame)
         return lbl_val
 
-    # ─────────────────────────────────────────────────────────────────────────
-    # CONNECTION MANAGEMENT
-    # ─────────────────────────────────────────────────────────────────────────
+    # ── Connection ────────────────────────────────────────────────────────────
 
     def refresh_ports(self):
         self.combo_ports.clear()
@@ -880,8 +1039,7 @@ class PyVitalSignsDAQ(QMainWindow):
 
             self.lbl_init_msg.setText("Initializing...")
             self.btn_connect.setText("DISCONNECT")
-            # Request current parameter values from Arduino after a short
-            # delay to allow the firmware init message to clear the UART.
+            # Read current firmware parameters once the boot messages have passed.
             QTimer.singleShot(1500, self._request_params)
             self.btn_connect.setStyleSheet(
                 "background-color: #ff8c00; color: #fff; padding: 8px; "
@@ -924,14 +1082,7 @@ class PyVitalSignsDAQ(QMainWindow):
                 self.fft_dlg.close()
 
     def _request_params(self):
-        """
-        Send {"cmd":"get"} to the Arduino to retrieve all current g_* values.
-        Called automatically 1.5 s after connecting, giving the firmware time
-        to finish its init message and start the 100 Hz stream.
-        The Arduino responds with one {"ack":"KEY","val":V} per parameter.
-        _on_data() routes each ACK to the param_cache via on_ack() on any
-        open SettingsDialog, or directly to param_cache here.
-        """
+        """Request all firmware parameters; the replies fill param_cache."""
         if self.serial_thread and self.serial_thread.running:
             self.serial_thread.send({"cmd": "get"})
 
@@ -945,28 +1096,14 @@ class PyVitalSignsDAQ(QMainWindow):
 
     def resp_tare(self):
         """
-        Tare (zero) the respiratory sensor baseline immediately.
-
-        Sets the IIR DC estimate (_pz_dc) to the mean of the last 50 raw
-        sensor samples, cancelling the resting offset instantly
-        instead of waiting for the IIR filter to converge (~200 s).
-
-        Workflow:
-          1. Place the animal on the sensor.
-          2. Wait 2–3 s for the signal to stabilise.
-          3. Click Resp. Tare.
-          4. The waveform recentres: only respiratory oscillations remain.
-
-        The tare value is session-only — it resets if the application is
-        restarted or the connection is toggled.
+        Set the DC estimate to the mean of the last 50 raw samples instead of
+        waiting ~200 s for the IIR. Session-only; resets on reconnect.
         """
-        # pz_raw_data holds the raw mV values before DC removal and inversion.
         recent = [v for v in self.pz_raw_data[-50:] if v != 0]
         if len(recent) < 10:
-            return   # Not enough data yet — ignore silently.
+            return
         self._pz_dc = sum(recent) / len(recent)
 
-        # Visual feedback: button flashes green briefly.
         self.btn_tare.setStyleSheet(
             "background-color: #006600; color: #fff; padding: 8px; "
             "font-weight: bold; border: none; border-radius: 4px;")
@@ -975,11 +1112,7 @@ class PyVitalSignsDAQ(QMainWindow):
             "font-weight: bold; border: none; border-radius: 4px;"))
 
     def open_fft(self):
-        """
-        Open the live PSD viewer (FFTVitalSignsWindow).
-        Non-modal — stays open alongside the main DAQ window.
-        Only one instance at a time; if already open, bring to front.
-        """
+        """Open the (non-modal, single-instance) PSD viewer."""
         if self.fft_dlg is None or not self.fft_dlg.isVisible():
             self.fft_dlg = FFTVitalSignsWindow(daq_window=self, parent=self)
             self.fft_dlg.setModal(False)
@@ -988,16 +1121,10 @@ class PyVitalSignsDAQ(QMainWindow):
             self.fft_dlg.raise_()
             self.fft_dlg.activateWindow()
 
-    # ─────────────────────────────────────────────────────────────────────────
-    # SETTINGS
-    # ─────────────────────────────────────────────────────────────────────────
+    # ── Settings ──────────────────────────────────────────────────────────────
 
     def open_settings(self):
-        """
-        Open the Settings dialog modally. The DAQ stream pauses automatically
-        inside SettingsDialog.__init__ and resumes on close.
-        Only one instance at a time.
-        """
+        """Open the modal Settings dialog (display pauses while it is open)."""
         if self.settings_dlg is not None and self.settings_dlg.isVisible():
             self.settings_dlg.raise_()
             self.settings_dlg.activateWindow()
@@ -1012,28 +1139,22 @@ class PyVitalSignsDAQ(QMainWindow):
             parent=self)
         self.settings_dlg.setModal(True)
         self.settings_dlg.exec_()
-        # exec_() blocks until dialog closes.
-        # Clear buffers and disconnect curves before resuming so the display
-        # starts clean without the sigmoidal IR artefact (zeros → live data)
-        # or the double-line artefact (pyqtgraph connects last old point to
-        # first new point across the pause gap).
+        # After the pause restart display and PSD buffers, so no zero-to-data step
+        # or connecting line across the gap is drawn.
         self.ir_data = [0] * self.max_points
         self.pz_data = [0] * self.max_points
-        # Keep ts_data continuous from where it left off
+        self._fft_clear()
         last_ts = self.ts_data[-1]
         self.ts_data = list(range(last_ts, last_ts + self.max_points * 10, 10))
-        # Disconnect curves (empty data) so pyqtgraph draws no connecting line
         self.curve_ir.setData([], [])
         self.curve_pz.setData([], [])
         self._buffer_fill = 0
         self.is_paused = False
 
-    # ─────────────────────────────────────────────────────────────────────────
-    # PLAYBACK CONTROL
-    # ─────────────────────────────────────────────────────────────────────────
+    # ── Playback ──────────────────────────────────────────────────────────────
 
     def toggle_pause(self):
-        """Pause or resume waveform display and CSV logging."""
+        """Pause / resume the display and CSV logging."""
         self.is_paused = not self.is_paused
         if self.is_paused:
             self.btn_play_pause.setText("▶ PLAY")
@@ -1046,9 +1167,7 @@ class PyVitalSignsDAQ(QMainWindow):
                 "background-color: #333; color: #fff; padding: 8px; "
                 "font-weight: bold; border: none; border-radius: 4px;")
 
-    # ─────────────────────────────────────────────────────────────────────────
-    # RECORDING MANAGEMENT
-    # ─────────────────────────────────────────────────────────────────────────
+    # ── Recording ─────────────────────────────────────────────────────────────
 
     def toggle_record(self):
         if not self.is_recording:
@@ -1105,9 +1224,7 @@ class PyVitalSignsDAQ(QMainWindow):
             self.csv_vitals = None
             self.csv_raw    = None
 
-    # ─────────────────────────────────────────────────────────────────────────
-    # EVENT MARKER
-    # ─────────────────────────────────────────────────────────────────────────
+    # ── Event markers ─────────────────────────────────────────────────────────
 
     def mark_event(self):
         if self.is_recording:
@@ -1132,117 +1249,102 @@ class PyVitalSignsDAQ(QMainWindow):
         self.event_lines_ir.clear()
         self.event_lines_pz.clear()
 
-    # ─────────────────────────────────────────────────────────────────────────
-    # MAIN UPDATE — called at 100 Hz by SerialThread signal
-    # ─────────────────────────────────────────────────────────────────────────
+    # ── Data path (100 Hz) ────────────────────────────────────────────────────
 
     def _on_data(self, data):
-        """
-        Slot connected to SerialThread.data_received.
-        Routes ACK/NAK responses to the Settings dialog;
-        forwards data packets to update_gui().
-        """
+        """Route ACK/NAK to param_cache and the Settings dialog; packets to update_gui()."""
         if 'ack' in data or 'nak' in data:
-            # Update param_cache with confirmed firmware value.
-            # Covers both {"cmd":"set"} ACKs and {"cmd":"get"} responses.
             key = data.get('ack')
             if key and 'val' in data:
                 val_cached = data['val']
-                # CALIB_SWING is stored in counts on the Arduino;
-                # convert to mV for display in the Settings panel.
+                # CALIB_SWING: counts on the firmware, mV in the panel
                 if key == 'CALIB_SWING':
                     val_cached = round(val_cached * _ADC_MV, 1)
                 self.param_cache[key] = val_cached
-            # Forward to open Settings dialog for status label update.
             if self.settings_dlg is not None:
                 self.settings_dlg.on_ack(data)
             return
         self.update_gui(data)
 
     def update_gui(self, data):
-        """
-        Process one incoming JSON data packet.
-
-        Steps per packet:
-          1. Clear "Initializing..." label on first arrival.
-          2. Extract fields; apply defaults for missing keys.
-          2b. Respiratory sensor signal conditioning:
-              - Convert counts → mV (10-bit ADC, 5 V reference).
-              - IIR low-pass (α=0.005 @ 100 Hz, fc≈0.08 Hz) tracks slow
-                DC baseline (animal weight, posture drift, ~200 s time const).
-              - Invert AC component so inspiratory peaks are positive.
-              - Shift signal upward by DC estimate so it stays positive at rest.
-              - Resp. Tare forces immediate convergence of the DC estimate.
-          3. Extract and validate the "ts" timestamp.
-          4. Update numeric readout labels.
-          5. Append to waveform buffers; discard oldest sample.
-          6. Redraw both waveform curves with real-time X axis.
-          7. Update visible X range (respiratory plot follows IR via XLink).
-          8. Prune event lines that have scrolled out of view.
-          9. If recording: write one row to each CSV file.
-             Resp_mV column contains the processed (conditioned) signal,
-             matching exactly what is displayed on screen.
-        """
-        # Step 1
+        """Process one data packet: readouts, buffers, plots, event lines, CSV."""
         if self.lbl_init_msg.text():
             self.lbl_init_msg.setText("")
 
         if self.is_paused:
             return
 
-        # Step 2
         hr = data.get('hr', 0)
         sp = data.get('sp', 0)
         rr = data.get('rr', 0)
         t  = data.get('t',  0)
         ir = data.get('ir', 0)
-        pz_raw = data.get('pz', 0) * _ADC_MV   # counts → mV (10-bit, 5 V ref)
+        pz_raw = data.get('pz', 0) * _ADC_MV
 
-        # Store raw mV in a separate buffer used by piezo_tare().
         self.pz_raw_data.append(pz_raw)
         self.pz_raw_data.pop(0)
 
-        # ── Piezo signal conditioning ─────────────────────────────────────────
-        # FSR406 / inverted piezo: inspiration increases pressure → resistance
-        # drops → ADC voltage drops → raw signal goes DOWN on inspiration.
-        # Steps:
-        #   1. IIR low-pass (α=0.005 @ 100 Hz → fc≈0.08 Hz) tracks slow DC
-        #      baseline (weight of animal, posture drift). Time constant ~200 s.
-        #   2. AC = DC_estimate − raw  →  inspiration becomes a positive peak.
-        #   3. Shift upward by DC_estimate so signal stays positive at rest.
+        # Respiratory conditioning: slow IIR DC estimate (alpha 0.005, ~0.08 Hz);
+        # AC about DC with polarity per _INVERT_RESP; DC added back so the trace
+        # stays positive at rest.
         if self._pz_dc is None:
-            self._pz_dc = pz_raw   # initialise on first packet
+            self._pz_dc = pz_raw
         self._pz_dc += 0.005 * (pz_raw - self._pz_dc)
-        # Apply inversion based on sensor type (see _INVERT_RESP above).
         pz_ac = (self._pz_dc - pz_raw) if _INVERT_RESP else (pz_raw - self._pz_dc)
         pz    = pz_ac + self._pz_dc
 
-        # Step 3 — "ts" is Arduino capture time; fall back to +10 ms increment
-        # for firmware without the ts field (maintains display without alignment).
+        # Arduino timestamp; +10 ms fallback for firmware without "ts".
         ts_raw = data.get('ts', None)
         ts_ms  = int(ts_raw) if ts_raw is not None else (self.ts_data[-1] + 10)
 
-        # Step 4
         self.val_hr.setText(str(hr)      if hr > 0 else "--")
         self.val_spo2.setText(str(sp)    if sp > 0 else "--")
         self.val_rr.setText(str(rr)      if rr > 0 else "--")
         self.val_temp.setText(f"{t:.1f}" if t  > 0 else "--.-")
 
-        # Step 5
-        self.ir_data.append(ir);    self.ir_data.pop(0)
-        self.pz_data.append(pz);    self.pz_data.pop(0)
-        self.ts_data.append(ts_ms); self.ts_data.pop(0)
+        # A time gap (pause, USB stall) or time going backwards (Arduino reset on
+        # reconnect) breaks uniform sampling: restart the PSD history, and the
+        # display buffers on a reset.
+        if self.fft_ts:
+            gap = ts_ms - self.fft_ts[-1]
+            if gap > 100 or gap < 0:
+                self._fft_clear()
+        if ts_ms < self.ts_data[-1]:
+            self.ts_data = [ts_ms - 10 * (self.max_points - 1 - i)
+                            for i in range(self.max_points)]
+            self.ir_data = [0] * self.max_points
+            self.pz_data = [0] * self.max_points
+            self._buffer_fill = 0
+            self.clear_event_lines()
 
-        # Step 6
-        self._buffer_fill = getattr(self, '_buffer_fill', self._PLOT_WARMUP) + 1
+        self.ts_data.append(ts_ms); self.ts_data.pop(0)
+        self.pz_data.append(pz);    self.pz_data.pop(0)
+
+        # The CSV always receives the raw ir; fft_ir holds the displayed value.
+        self.fft_ts.append(ts_ms)
+        self.fft_pz.append(pz)
+        self.fft_raw.append(ir)
+        if self._ir_dirty:
+            self._rebuild_ir_view()
+        else:
+            v_ir = self._process_ir(ir)
+            self.ir_data.append(v_ir); self.ir_data.pop(0)
+            self.fft_ir.append(v_ir)
+            # Every ~1 s: redesign if the measured fs drifted > 5 % from the design.
+            self._ir_fs_cnt += 1
+            if self._ir_fs_cnt >= 100:
+                self._ir_fs_cnt = 0
+                fs_now = self._estimate_ir_fs()
+                if abs(fs_now - self._ir_fs) / self._ir_fs > 0.05:
+                    self._ir_dirty = True
+
+        self._buffer_fill += 1
         if self._buffer_fill >= self._PLOT_WARMUP:
             self.curve_ir.setData(self.ts_data, self.ir_data)
             self.curve_pz.setData(self.ts_data, self.pz_data)
 
-        # Step 7
         self.plot_ir.setXRange(self.ts_data[0], self.ts_data[-1], padding=0)
 
-        # Step 8
         visible_start = self.ts_data[0]
         for collection, plot in [(self.event_lines_ir, self.plot_ir),
                                   (self.event_lines_pz, self.plot_pz)]:
@@ -1251,7 +1353,6 @@ class PyVitalSignsDAQ(QMainWindow):
                     plot.removeItem(line)
             collection[:] = [(l, ts) for l, ts in collection if ts >= visible_start]
 
-        # Step 9
         if self.is_recording:
             if self.ts_origin_arduino is None:
                 self.ts_origin_arduino = ts_ms
@@ -1273,9 +1374,7 @@ class PyVitalSignsDAQ(QMainWindow):
             self.csv_raw.writerow(
                 [current_time, ts_arduino_ms, ir, pz, event_raw_val])
 
-    # ─────────────────────────────────────────────────────────────────────────
-    # APPLICATION SHUTDOWN
-    # ─────────────────────────────────────────────────────────────────────────
+    # ── Shutdown ──────────────────────────────────────────────────────────────
 
     def closeEvent(self, event):
         if self.is_recording:
@@ -1291,7 +1390,7 @@ class PyVitalSignsDAQ(QMainWindow):
 # ════════════════════════════════════════════════════════════════════════════
 
 if __name__ == '__main__':
-    # Spyder / IPython: reuse existing QApplication to avoid RuntimeError.
+    # Reuse an existing QApplication (Spyder / IPython).
     app = QApplication.instance()
     if app is None:
         app = QApplication(sys.argv)

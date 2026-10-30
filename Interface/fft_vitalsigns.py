@@ -30,8 +30,9 @@ the same buffers used by the main waveform display.
 ════════════════════════════════════════════════════════════════════════════════
 DESIGN
 ════════════════════════════════════════════════════════════════════════════════
-This window is a standalone QDialog that reads directly from the parent
-PyVitalSignsDAQ window's live buffers (ir_data, pz_data, ts_data).
+This window is a standalone QDialog that reads from the parent
+PyVitalSignsDAQ window's long history (~60 s) through get_fft_buffers(),
+which returns timestamps, IR and respiratory signals on a uniform time grid.
 It does NOT open its own serial connection — exactly one source of truth.
 
 PSD method: Welch (scipy.signal.welch), matching the offline MATLAB
@@ -78,12 +79,14 @@ class FFTVitalSignsWindow(QDialog):
                         matching MATLAB pwelch()).
       Detrend         — remove linear trend before PSD to suppress DC drift.
       Log Y           — logarithmic Y axis (recommended for PSD comparison).
-      X max (Hz)      — upper frequency limit of the displayed X axis.
+      X min / X max   — lower / upper frequency limits of the displayed X axis.
+                        The peak readout in the status bar searches only inside
+                        this band; the Y axis rescales to the visible band.
 
     Attributes:
         daq : PyVitalSignsDAQ
-            Reference to the parent DAQ window. Buffers are read directly:
-            daq.ir_data, daq.pz_data, daq.ts_data (all lists, max_points long).
+            Reference to the parent DAQ window. Data are obtained with
+            daq.get_fft_buffers() -> (ts_ms, ir, pz), three equal-length lists.
     """
 
     def __init__(self, daq_window, parent=None):
@@ -112,7 +115,7 @@ class FFTVitalSignsWindow(QDialog):
         self.spin_window = QDoubleSpinBox()
         self.spin_window.setRange(1.0, 120.0)
         self.spin_window.setSingleStep(1.0)
-        self.spin_window.setValue(5.0)
+        self.spin_window.setValue(30.0)
         self.spin_window.setToolTip(
             "How much signal history (seconds) is fed into Welch's method.\n"
             "More history → more segments averaged → smoother PSD.\n"
@@ -132,7 +135,7 @@ class FFTVitalSignsWindow(QDialog):
         self.spin_segment = QDoubleSpinBox()
         self.spin_segment.setRange(0.5, 30.0)
         self.spin_segment.setSingleStep(0.5)
-        self.spin_segment.setValue(3.0)
+        self.spin_segment.setValue(10.0)
         self.spin_segment.setToolTip(
             "Length of each FFT segment inside Welch's method (nperseg).\n"
             "Sets frequency resolution: Δf ≈ 1 / Segment(s).\n"
@@ -147,6 +150,18 @@ class FFTVitalSignsWindow(QDialog):
             "Window function applied to each segment before its FFT.\n"
             "Hamming matches MATLAB pwelch() default.")
         ctrl.addWidget(self.combo_winfn)
+
+        ctrl.addWidget(QLabel("X min (Hz):"))
+        self.spin_xmin = QDoubleSpinBox()
+        self.spin_xmin.setRange(0.0, 29.0)
+        self.spin_xmin.setSingleStep(0.5)
+        self.spin_xmin.setValue(0.0)
+        self.spin_xmin.setToolTip(
+            "Lower frequency limit of the X axis (and of the peak search).\n"
+            "Raise it to zoom in on one band, e.g. 3 Hz to hide respiration\n"
+            "and read only the cardiac peak. Y axis rescales to what is visible.")
+        self.spin_xmin.valueChanged.connect(self._apply_xrange)
+        ctrl.addWidget(self.spin_xmin)
 
         ctrl.addWidget(QLabel("X max (Hz):"))
         self.spin_xmax = QDoubleSpinBox()
@@ -190,6 +205,9 @@ class FFTVitalSignsWindow(QDialog):
         self.plot.getAxis('left').enableAutoSIPrefix(False)
         self.plot.showGrid(x=True, y=True, alpha=0.25)
         self.plot.addLegend(offset=(10, 10))
+        # Y axis autoscale considers only the visible X range, so zooming in
+        # on a band (X min / X max) also rescales the amplitude.
+        self.plot.setAutoVisible(y=True)
 
         self.curve_ir = self.plot.plot(
             pen=pg.mkPen('#b30000', width=2), name='IR-PPG (Heart Rate)')
@@ -217,7 +235,15 @@ class FFTVitalSignsWindow(QDialog):
         self.plot.setLogMode(x=False, y=self.chk_log.isChecked())
 
     def _apply_xrange(self):
-        self.plot.setXRange(0, self.spin_xmax.value(), padding=0)
+        """Apply X min / X max to the plot, keeping X max above X min."""
+        lo = self.spin_xmin.value()
+        hi = self.spin_xmax.value()
+        if hi < lo + 1.0:                       # keep a valid, visible range
+            hi = min(lo + 1.0, self.spin_xmax.maximum())
+            self.spin_xmax.blockSignals(True)
+            self.spin_xmax.setValue(hi)
+            self.spin_xmax.blockSignals(False)
+        self.plot.setXRange(lo, hi, padding=0)
 
     def _compute_psd(self, values, fs):
         """
@@ -244,9 +270,11 @@ class FFTVitalSignsWindow(QDialog):
         Reads directly from the DAQ window's live buffers — no data copy,
         no serial access.
         """
-        ts   = self.daq.ts_data    # Arduino timestamps (ms)
-        ir   = self.daq.ir_data    # IR raw counts from MAX30102
-        pz   = self.daq.pz_data    # Respiratory sensor in mV, DC-removed, polarity-corrected
+        # One call returns all three channels, uniformly resampled:
+        #   ts — Arduino timestamps (ms)
+        #   ir — IR as displayed in the main window (raw or filtered)
+        #   pz — respiratory sensor in mV, DC-removed, polarity-corrected
+        ts, ir, pz = self.daq.get_fft_buffers()
 
         # Need at least a few samples to estimate fs and compute a PSD.
         if len(ts) < 20:
@@ -285,9 +313,10 @@ class FFTVitalSignsWindow(QDialog):
         self.curve_pz.setData(freq_pz, pxx_pz)
 
         # Peak frequency for each channel — most likely the dominant rhythm.
+        xmin = self.spin_xmin.value()
         xmax = self.spin_xmax.value()
-        mask_f_ir = freq_ir <= xmax
-        mask_f_pz = freq_pz <= xmax
+        mask_f_ir = (freq_ir >= xmin) & (freq_ir <= xmax)
+        mask_f_pz = (freq_pz >= xmin) & (freq_pz <= xmax)
 
         peak_ir_hz = (freq_ir[mask_f_ir][np.argmax(pxx_ir[mask_f_ir])]
                       if mask_f_ir.any() else 0.0)

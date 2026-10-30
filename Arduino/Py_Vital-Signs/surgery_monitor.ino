@@ -1,8 +1,9 @@
 /**
  * @file    surgery_monitor.ino
- * PROJECT: Vital-signs monitor — small rodents (rat / mouse)
+ * PROJECT: Vital-signs monitor
  * @version 1.0
  * @author  Flávio Mourão — Mar, 2026
+ * @updated Oct, 2026
  *
  * ═══════════════════════════════════════════════════════════════════════════════
  * DESCRIPTION
@@ -53,7 +54,7 @@
  * │  Task 1 — Threshold calibration    every 2 s                             │
  * │  Task 2 — Temperature conversion   every 1 s                             │
  * │  Task 3 — MAX30102 HR + SpO2       every loop() call (non-blocking)      │
- * │  Task 4 — OLED display             ~30 FPS (33 ms)                       │
+ * │  Task 4 — OLED display   draw every 66 ms (~15 FPS), one page per loop()  │
  * │  Task 5 — ESP8266 vital signs stream  100 Hz via Serial3                  │
  * │  Task 6 — Python USB stream + config  100 Hz out / on-demand in           │
  * └──────────────────────────────────────────────────────────────────────────┘
@@ -68,6 +69,20 @@
  *   interrupts during execution (~10-15 us). This is well below the 1 ms
  *   TIMER0 period, so millis() drift is negligible. If TIMER1_COMPA_vect
  *   execution ever exceeds ~900 us, permanent millis() drift will occur.
+ *
+ * LOOP TIMING  (debug orientation — read this first if the stream is slow)
+ *   Both 100 Hz streams send at most one packet per loop() iteration, so the
+ *   loop period must stay well below 10 ms. Blocking calls that were measured
+ *   on this hardware: u8g2.sendBuffer() (512 B over I2C) ~23 ms, drawing the
+ *   text lines ~24 ms, one 128x8 page via updateDisplayArea() ~6 ms. With the
+ *   original blocking OLED the loop ran at ~52 ms, giving ~16-20 packets/s,
+ *   a 16 Hz IR/FFT record and meaningless filters. The OLED is therefore
+ *   drawn every INTERVAL_DISPLAY_MS into the frame buffer, only changed text
+ *   fields are redrawn, and ONE page is sent per loop() iteration.
+ *   Raising the draw rate (smaller INTERVAL_DISPLAY_MS) makes the page
+ *   transfers saturate the loop and the stream rate falls again (~91 Hz seen
+ *   at 33 ms); 66 ms gives ~98 Hz. Check with serial_rate_test.py: median "ts"
+ *   spacing 10 ms, no burst of 1-9 ms spacings.
  *
  * ═══════════════════════════════════════════════════════════════════════════════
  * DISPLAY LAYOUT  (SSD1306, 128x32 px, I2C)
@@ -334,7 +349,8 @@ static const uint8_t N_RR_SHIFT   = 2;    // log2(N_RR_SAMPLES)
 // ═══════════════════════════════════════════════════════════════════════════════
 //
 //  The right half of the 128x32 OLED (columns 64-127) displays a scrolling
-//  respiratory PPG. The trace advances one pixel per display frame (~30 FPS).
+//  respiratory trace. The trace advances one pixel per display frame (~15 FPS at
+//  INTERVAL_DISPLAY_MS = 66, i.e. one sweep of 64 px every ~4.2 s).
 //  WAVE_ERASER_W = 4 pixels creates a visible gap ahead of the trace cursor,
 //  replicating the travelling-cursor style of ICU bedside monitors.
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -350,7 +366,7 @@ static const uint8_t WAVE_ERASER_W = 4;    // Columns erased ahead of trace.
 //  TASK SCHEDULING
 // ═══════════════════════════════════════════════════════════════════════════════
 
-static const uint8_t  INTERVAL_DISPLAY_MS = 33;    // ~30 FPS
+static const uint8_t  INTERVAL_DISPLAY_MS = 66;    // ~15 FPS (see LOOP TIMING in the header)
 static const uint16_t INTERVAL_SLOW_MS    = 1000;  // Temperature (1 Hz)
 static const uint16_t BLINK_INTERVAL_MS   = 400;   // RR "--" blink when no signal
 
@@ -682,7 +698,7 @@ void setup()
     u8g2.clearBuffer();
 
     // Check sensor - MAX30102 init — defined in surgery_monitor_MAX30102.ino.
-    // Halt on failure: sensor required for full multiparametric operation.
+    // Failure is reported on the OLED and the serial port.
     if (!max30102_init()) {
         u8g2.clearBuffer();
         u8g2.setFont(u8g2_font_6x10_tf);
@@ -691,7 +707,7 @@ void setup()
         u8g2.setCursor(0, 26);
         u8g2.print(F("Check wiring / I2C"));
         u8g2.sendBuffer();
-        while (false); // return to true in case to stop
+        // Does not halt: the monitor keeps running (RR, temperature, streams) without the sensor.
     }
 
     vitalsigns_init();      // ESP8266 WebSocket stream (Serial3)
@@ -750,7 +766,21 @@ void loop()
     // Defined in surgery_monitor_MAX30102.ino.
     max30102_update();
 
-    // TASK 4 — OLED display 128x32 (~30 FPS)
+    // TASK 4 — OLED display 128x32
+    //
+    // Two decoupled stages (v2.1 — non-blocking display):
+    //   (a) DRAW  every INTERVAL_DISPLAY_MS (66 ms, ~15 FPS): update the frame buffer.
+    //       Text fields are redrawn ONLY when their value changes (text
+    //       rendering is the slow part on AVR); the waveform needs just one
+    //       line segment plus the rolling eraser per frame.
+    //   (b) SEND  one 128x8 display page (16 tiles) per loop() iteration via
+    //       updateDisplayArea(), instead of sendBuffer() which pushes all 512
+    //       bytes in one blocking ~23 ms I2C burst. A page takes ~6 ms, so the
+    //       loop stays responsive and the 100 Hz USB/ESP streams keep their
+    //       timing. oledPending is a bit mask: bit n = page n must be sent.
+    static int16_t oHR = -32768, oSpo2 = -32768, oRR = -32768, oTemp = -32768;
+    static uint8_t oledPending = 0x0F;      // first frame: send every page
+
     if (now - timerDisplay >= INTERVAL_DISPLAY_MS) {
         timerDisplay += INTERVAL_DISPLAY_MS;
 
@@ -771,41 +801,63 @@ void loop()
         const int safeHR   = heartRate;
         const int safeSpo2 = spO2;
 
-        // Selective erase: clear text regions only. Waveform area is managed
-        // column-by-column by the rolling eraser below to avoid flicker.
-        u8g2.setDrawColor(0);
-        u8g2.drawBox(0,  0, 61, 32);
-        u8g2.drawBox(61, 0, 67, WAVE_Y_TOP);
-        u8g2.setDrawColor(1);
+        // _tr = restricted charset (ASCII 32-127): glyph lookup is much faster
+        // than the full _tf font. All on-screen text is plain ASCII.
+        u8g2.setFont(u8g2_font_6x10_tr);
 
-        u8g2.setFont(u8g2_font_6x10_tf);
+        // Per-field redraw: erase only that field, print, flag affected pages.
+        // Pages: 0 = rows 0-7, 1 = 8-15, 2 = 16-23, 3 = 24-31.
 
-        // Left column: HR, SpO2, Temperature
-        u8g2.setCursor(0, 9);
-        u8g2.print(F("HR  : "));
-        if (safeHR > 0) u8g2.print(safeHR); else u8g2.print(F("---"));
-
-        u8g2.setCursor(0, 20);
-        u8g2.print(F("Sat%: "));
-        if (safeSpo2 > 0) u8g2.print(safeSpo2); else u8g2.print(F("---"));
-
-        u8g2.setCursor(0, 31);
-        u8g2.print(F("Temp: "));
-        if (tempCelsius >= g_TEMP_MIN_C && tempCelsius <= g_TEMP_MAX_C) {
-            u8g2.print(tempCelsius, 1);
-        } else if (tempCelsius == 0.0f) {
-            u8g2.print(F("---"));   // Probe disconnected.
-        } else {
-            u8g2.print(F("OUT"));   // Outside physiological range.
+        // Line 1 (y 0-10): HR
+        if (safeHR != oHR) {
+            oHR = safeHR;
+            u8g2.setDrawColor(0); u8g2.drawBox(0, 0, 61, 11); u8g2.setDrawColor(1);
+            u8g2.setCursor(0, 9);
+            u8g2.print(F("HR  : "));
+            if (safeHR > 0) u8g2.print(safeHR); else u8g2.print(F("---"));
+            oledPending |= 0x03;                       // pages 0-1
         }
 
-        // Right column: RR
-        u8g2.setCursor(63, 9);
-        u8g2.print(F("RR: "));
-        if (safeResp > 0) {
-            u8g2.print(safeResp);
-        } else if (blinkVisible) {
-            u8g2.print(F("--"));   // Blinks during apnoea or no signal.
+        // Line 2 (y 11-20): SpO2
+        if (safeSpo2 != oSpo2) {
+            oSpo2 = safeSpo2;
+            u8g2.setDrawColor(0); u8g2.drawBox(0, 11, 61, 10); u8g2.setDrawColor(1);
+            u8g2.setCursor(0, 20);
+            u8g2.print(F("Sat%: "));
+            if (safeSpo2 > 0) u8g2.print(safeSpo2); else u8g2.print(F("---"));
+            oledPending |= 0x06;                       // pages 1-2
+        }
+
+        // Line 3 (y 21-31): Temperature. tcode: tenths of a degree, or
+        // -1 = probe disconnected, -2 = outside physiological range.
+        int16_t tcode;
+        if (tempCelsius >= g_TEMP_MIN_C && tempCelsius <= g_TEMP_MAX_C)
+            tcode = (int16_t)(tempCelsius * 10.0f + 0.5f);
+        else if (tempCelsius == 0.0f) tcode = -1;
+        else                          tcode = -2;
+        if (tcode != oTemp) {
+            oTemp = tcode;
+            u8g2.setDrawColor(0); u8g2.drawBox(0, 21, 61, 11); u8g2.setDrawColor(1);
+            u8g2.setCursor(0, 31);
+            u8g2.print(F("Temp: "));
+            if (tcode >= 0)       u8g2.print(tempCelsius, 1);
+            else if (tcode == -1) u8g2.print(F("---"));   // Probe disconnected.
+            else                  u8g2.print(F("OUT"));   // Outside physiological range.
+            oledPending |= 0x0C;                       // pages 2-3
+        }
+
+        // Right column: RR. rrShown: rpm, -1 = blink "--" (apnoea / no
+        // signal, visible phase), 0 = blank (blink hidden phase).
+        const int16_t rrShown = (safeResp > 0) ? (int16_t)safeResp
+                                               : (blinkVisible ? -1 : 0);
+        if (rrShown != oRR) {
+            oRR = rrShown;
+            u8g2.setDrawColor(0); u8g2.drawBox(61, 0, 67, WAVE_Y_TOP); u8g2.setDrawColor(1);
+            u8g2.setCursor(63, 9);
+            u8g2.print(F("RR: "));
+            if (rrShown > 0)       u8g2.print(rrShown);
+            else if (rrShown < 0)  u8g2.print(F("--"));
+            oledPending |= 0x03;                       // pages 0-1
         }
 
         // Respiratory waveform trace
@@ -843,7 +895,16 @@ void loop()
             u8g2.setDrawColor(1);
         }
 
-        u8g2.sendBuffer();
+        // Waveform occupies y 14-31 → pages 1-3 change every frame.
+        oledPending |= 0x0E;
+    }
+
+    // Stage (b): send ONE pending page per loop() iteration (~6 ms each).
+    if (oledPending) {
+        uint8_t pg = 0;
+        while (!(oledPending & (1 << pg))) pg++;
+        u8g2.updateDisplayArea(0, pg, 16, 1);
+        oledPending &= ~(1 << pg);
     }
 
     // TASK 5 — Vital Signs Streaming (non-blocking, 100 Hz out to Serial3)

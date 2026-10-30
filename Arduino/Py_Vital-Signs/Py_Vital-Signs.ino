@@ -1,8 +1,9 @@
 /**
  * @file    Py_Vital-Signs.ino
- * PROJECT: Vital-signs monitor — small rodents (rat / mouse)
+ * PROJECT: Vital-signs monitor
  * @version 1.0
  * @author  Flávio Mourão — Mar, 2026
+ * @updated Oct, 2026
  *
  * ═══════════════════════════════════════════════════════════════════════════════
  * MODULE RESPONSIBILITY
@@ -12,6 +13,8 @@
  *   OUTBOUND (Arduino → Python, 100 Hz):
  *     JSON stream of all physiological variables + millis() timestamp.
  *     Format: {"hr":N,"sp":N,"rr":N,"pz":N,"t":N,"ir":N,"ts":N}
+ *       ir = latest MAX30102 FIFO sample at serialisation time (a sample can
+ *            repeat, ~10 % of packets, when loop() is late); ts = millis().
  *
  *   INBOUND (Python → Arduino, on demand):
  *     Configuration commands from the Python Settings panel.
@@ -29,7 +32,8 @@
  * interleaving with the incoming command and corrupting key extraction.
  *
  * After the command '\n' is received, the ACK/NAK is sent and the outbound
- * stream resumes. Total command window: ~5–10 ms per parameter.
+ * stream resumes. Total command window: ~5–10 ms per parameter (the Python
+ * side additionally waits 60 ms after SOH so the packet in flight finishes).
  *
  * The Python side uses a queue.Queue (same pattern as conditioning_setup_dark.py):
  * all serial writes happen inside SerialThread.run() — never from the main Qt
@@ -54,8 +58,29 @@
  * TEMP_MIN       surgery_monitor           g_TEMP_MIN_C
  * TEMP_MAX       surgery_monitor           g_TEMP_MAX_C
  *
+ * PULSE_WIDTH   surgery_monitor_MAX30102  g_PULSE_WIDTH     (reruns sensor setup)
+ *
  * All parameters are saved to EEPROM on change and restored on power-up.
  * See surgery_monitor_MAX30102.ino for the EEPROM memory map.
+ *
+ * ═══════════════════════════════════════════════════════════════════════════════
+ * TIMING AND LOAD  (debug orientation)
+ * ═══════════════════════════════════════════════════════════════════════════════
+ * - At most ONE packet is sent per loop() iteration, so the stream can only
+ *   reach 100 packets/s if loop() runs well below 10 ms. A slow loop shows up
+ *   as a low packet rate and as "fs ≈ N Hz" in the Python IR filter bar.
+ * - The schedule starts at millis() in py_vital_signs_init() and resynchronises
+ *   after a stall (bounded catch-up): there are no bursts of back-to-back
+ *   packets with duplicated IR and 1–3 ms timestamp spacing.
+ * - Load: ~80 B/packet x 100 Hz = ~8 kB/s, ~70 % of 115200 baud (~11.5 kB/s).
+ *   Serial.print blocks once the 64 B TX buffer is full; if packets are lost,
+ *   raise the baud rate here (Serial.begin in surgery_monitor.ino) and in
+ *   Py_VitalSigns_DAQ.py together (250000 or 500000).
+ * - Opening the serial port resets the board (splash 3 s + init): a rate test
+ *   that includes the first ~3.5 s reads ~80 pkt/s even if the stream is 98 Hz.
+ *   Judge the rate from the "ts" spacing (median 10 ms, p95 ~14 ms).
+ * - Any non-JSON text printed on Serial0 (boot messages, debug) is ignored by
+ *   the Python DAQ but counts as a "bad line" in serial_rate_test.py.
  */
 
 #include <Arduino.h>
@@ -218,6 +243,10 @@ void py_vital_signs_init()
     cmdLen        = 0;
     cmdInProgress = false;
     memset(cmdBuffer, 0, sizeof(cmdBuffer));
+    // Start the 100 Hz schedule from "now". With timerUSB = 0 and millis()
+    // already at ~3500 ms (splash screen + init), the catch-up scheduler below
+    // would fire ~350 packets back-to-back right after boot.
+    timerUSB = millis();
     Serial.println(F("[OK] USB stream ready — 100 Hz outbound | inbound cmd parser active."));
 }
 
@@ -271,6 +300,11 @@ void py_vital_signs_update()
     const unsigned long nowMs = millis();
     if (nowMs - timerUSB < INTERVAL_USB_MS) return;
     timerUSB += INTERVAL_USB_MS;
+    // Bounded catch-up: after a stall longer than one extra interval (long
+    // loop iteration, command handling) resynchronise instead of sending a
+    // burst of back-to-back packets. A burst would carry the same IR sample
+    // many times with timestamps only 1-3 ms apart, which corrupts the PSD.
+    if (nowMs - timerUSB >= INTERVAL_USB_MS) timerUSB = nowMs;
 
     // Atomic snapshot of ISR-written volatile variables.
     noInterrupts();

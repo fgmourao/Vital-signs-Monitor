@@ -1,4 +1,4 @@
-# Vital-signs Monitor v1.0
+# Vital-signs Monitor v1.1
 > **Under development**
 
 Real-time, non-invasive physiological monitoring during experimental surgeries, stereotaxic procedures, and deep anaesthesia protocols in small rodents. ATmega2560 acquisition board controlled by a Python/PyQt5 application over USB, with simultaneous Wi-Fi browser dashboard via an on-board ESP8266.
@@ -9,12 +9,12 @@ Real-time, non-invasive physiological monitoring during experimental surgeries, 
 
 Four physiological parameters are acquired simultaneously:
 
-- **Heart Rate** — MAX30102 optical sensor (IR channel), SparkFun `checkForBeat()` peak detector, rolling mean over N=6 beats
-- **SpO2** — MAX30102 Red + IR channels, Maxim `spo2_algorithm` (sliding window: retain 75, refill 25 per update)
+- **Heart Rate** — MAX30102 optical sensor (IR channel), SparkFun `checkForBeat()` peak detector, rolling mean over N=6 beats; cleared to 0 after 5 s without an accepted beat (`HR_TIMEOUT_MS`)
+- **SpO2** — MAX30102 Red + IR channels, Maxim `spo2_algorithm` (sliding window: retain 75, refill 25 per update); cleared to 0 after 10 s without a valid block (`SPO2_TIMEOUT_MS`)
 - **Respiratory Rate** — respiratory sensor at A0 (piezo film or FSR406 pressure sensor), software Schmitt trigger with adaptive envelope calibration every 2 s
 - **Core Temperature** — NTC 100 kΩ rectal thermistor (A1), Beta equation conversion
 
-All parameters are streamed at 100 Hz to the Python DAQ via USB-Serial and to a browser dashboard via WebSocket over Wi-Fi.
+All parameters are streamed at ~100 Hz (measured ≈98 pkt/s, median timestamp spacing 10 ms) to the Python DAQ via USB-Serial and to a browser dashboard via WebSocket over Wi-Fi.
 
 ---
 
@@ -56,14 +56,15 @@ MAX30102 internal (400 Hz raw)
               │
               ├─ PATH 1 — Heart Rate
               │    checkForBeat(irRaw) at 100 Hz
-              │    → _process_beat(): physiological gate + outlier rejection
-              │    → rolling mean N=6 → heartRate (BPM)
+              │    → _process_beat(): interval from sample index × measured sample period,
+              │      physiological gate + outlier rejection
+              │    → rolling mean N=6 → heartRate (BPM); 0 after HR_TIMEOUT_MS
               │
               └─ PATH 2 — SpO2
                    software decimation × g_DECIM_RATIO (default 1)
                    → irBuffer[100] + redBuffer[100]
                    → maxim_heart_rate_and_oxygen_saturation()
-                   → sliding window (retain 75, refill 25) → spO2 (%)
+                   → sliding window (retain 75, refill 25) → spO2 (%); 0 after SPO2_TIMEOUT_MS
 ```
 
 ### Respiratory Rate
@@ -243,12 +244,14 @@ The system is compatible with two sensor types connected to A0 via a voltage div
 |---|---|---|---|
 | HR Min | 40 BPM | 200 BPM | 250 BPM |
 | HR Max | 200 BPM | 500 BPM | 800 BPM |
-| LED Brightness | 80 | 40–60 | 20–40 |
-| ADC Range | 16384 | 4096 | 2048–4096 |
+| LED Brightness | 25 | 40–60 | 20–40 |
+| ADC Range | 8192 | 4096 | 2048–4096 |
 | Sample Average | 4 | 1–4 | 1–2 |
 | Pulse Width | 215 µs | 215–411 µs | 215–411 µs |
 
-Target IR raw DC level: 50,000–130,000 counts (20–50% of ADC full-scale). Verify in the waveform plot after positioning the sensor.
+Human bench values above (LED 25, ADC 8192) gave a stable HR and SpO2 record (AC peak-to-peak median ≈760 counts). Reference: LED 80 / ADC 16384 gave AC peak-to-peak ≈2240 counts, outside the `checkForBeat()` gate (see [T2]).
+
+Target: IR AC peak-to-peak of **200–700 counts** per cardiac cycle (gate: >20 and <1000). Adjust LED until this holds; the AC amplitude scales with LED current. The IR DC level is secondary — avoid saturation (262,143) and verify in the waveform plot after positioning the sensor.
 
 ---
 
@@ -260,6 +263,8 @@ The Maxim `spo2_algorithm.cpp` FIR filters were designed for 25 Hz input (DECIM_
 **[T2] checkForBeat() with hardware-averaged signal**
 The SparkFun `checkForBeat()` detector was calibrated for unaveraged signals. With `sampleAverage = 4` the AC component is smoothed before detection. If HR detection fails on rodents, reduce `sampleAverage` to 1 via Settings to restore full AC amplitude at 400 Hz.
 
+`checkForBeat()` accepts a beat only if the previous cycle's AC peak-to-peak is between 20 and 1000 counts; with a larger amplitude every beat is rejected (HR then stays at 0 after the timeout). Its 23-tap FIR low-pass (−3 dB ≈ 3 Hz) also strongly attenuates rodent cardiac frequencies (5–8 Hz: gain ≈0.36–0.04 relative to DC), so it is not expected to work reliably in rats and mice. The planned replacement is a band-pass (3.5–12 Hz) plus adaptive threshold detector (`alt_hr_detector.m`).
+
 **[T3] ADC Range**
 `adcRange = 16384` is required for human fingertip at LED = 80 to avoid saturation (IR DC reaches 262,143 = 18-bit ceiling). For rodent thin tissue, try `adcRange = 4096` and verify IR raw in the waveform plot.
 
@@ -267,7 +272,7 @@ The SparkFun `checkForBeat()` detector was calibrated for unaveraged signals. Wi
 The respiratory signal DC filter has a time constant of ~200 s at 100 Hz. When the animal is first placed on the sensor, the display may appear shifted until the filter converges. Use **Resp. Tare** to force immediate convergence.
 
 **[T5] SparkFun library internal buffer — STORAGE_SIZE**
-The SparkFun MAX3010x library uses an internal ring buffer (`STORAGE_SIZE`) to hold FIFO data between `check()` calls. The default value of 4 samples causes silent data loss whenever `loop()` is delayed beyond ~40 ms (e.g. by the OLED display task), producing irregular sample spacing in `irBuffer[]` and `redBuffer[]`. This distorts the Maxim FIR filters and typically causes SpO2 to read 100% or HR to be erratic. This project set `STORAGE_SIZE = 64` by editing `MAX30105.h` at `~/Documents/Arduino/libraries/SparkFun_MAX3010x_Sensor_Library/src/MAX30105.h`
+The SparkFun MAX3010x library uses an internal ring buffer (`STORAGE_SIZE`) to hold FIFO data between `check()` calls. The default value of 4 samples causes silent data loss whenever `loop()` is delayed beyond ~40 ms (e.g. by the OLED display task), producing irregular sample spacing in `irBuffer[]` and `redBuffer[]`. This distorts the Maxim FIR filters and typically causes SpO2 to read 100% or HR to be erratic. The OLED is now drawn page-wise (non-blocking), so `loop()` runs at ~10 ms, but the larger buffer is kept as a safeguard. This project set `STORAGE_SIZE = 64` by editing `MAX30105.h` at `~/Documents/Arduino/libraries/SparkFun_MAX3010x_Sensor_Library/src/MAX30105.h`
 
 **[T6] SpO2 reference values**
 The Maxim `spo2_algorithm` lookup table was calibrated for adult human fingertip measurements. In anaesthetised rodents, SpO2 values of 88–95% have been reported in the literature. If the monitor reads 99–100% during rodent anaesthesia, this may reflect algorithm miscalibration (next steps...)
@@ -299,6 +304,9 @@ The Maxim `spo2_algorithm` lookup table was calibrated for adult human fingertip
 | `MAX30102_Diagnostic_Tool.ino` | Standalone diagnostic sketch — IR waveform and SpO2 algorithm analysis |
 | `Py_VitalSigns_DAQ.py` | Python DAQ application (PyQt5 + pyqtgraph) |
 | `fft_vitalsigns.py` | Live PSD viewer — Welch method for HR and respiratory spectral analysis |
+| `serial_rate_test.py` | Serial stream rate check (packets/s and timestamp spacing) |
+| `emulate_firmware_hr.m` | MATLAB emulation of the firmware HR chain on `*_raw.csv` records |
+| `alt_hr_detector.m` | MATLAB prototype of the alternative HR detector (band-pass + adaptive threshold) |
 
 Arduino library dependencies (install via Arduino IDE Library Manager):
 - **SparkFun MAX3010x Pulse and Proximity Sensor Library** ⚠️ requires manual modification (see [T5])
@@ -328,7 +336,9 @@ This setting controls the size of the library's internal ring buffer. With the d
 
 - HR and SpO2 values are not validated against a calibrated reference instrument.
 - SpO2 may read 100% consistently if `DECIM_RATIO = 1` (increase to 4 via Settings) or if the SparkFun library `STORAGE_SIZE` is not set to 64 (see [T5]).
-- The `_debug_serial()` diagnostic output is plain text and incompatible with the Python DAQ. Use only with the Arduino IDE Serial Monitor when the Python application is not connected.
+- The plain-text diagnostic output (enabled with the `DEBUG_SERIAL` macro, default 0) is incompatible with the Python DAQ. Use only with the Arduino IDE Serial Monitor when the Python application is not connected.
+- Opening the serial port resets the board (~3.5 s of boot text before the stream starts). Rate tests must discard this period.
+- The HR detector (`checkForBeat()`) has not been validated in rodents (see [T2]).
 - If the USB cable is disconnected during a recording session, the CSV files may be incomplete. Always stop recording before disconnecting.
 - Primary Wi-Fi client assignment is first-connect order. If a secondary workstation connects before the primary, it will receive 25 Hz instead of 100 Hz.
 - The Resp. Tare is session-only — it resets if the application is restarted or the connection is toggled.
@@ -337,11 +347,11 @@ This setting controls the size of the library's internal ring buffer. With the d
 
 ## Author
 
-**v1.0 (2026)**
+**v1.1 (2026)**
 Flavio Afonso Goncalves Mourao — [mourao.fg@gmail.com](mailto:mourao.fg@gmail.com)
 *CNPq/MCTI/FNDCT Nº 21/2024 — Processo 446467/2024-3*
 *Federal University of Minas Gerais, Brazil*
 
 ---
 
-*Last update: September 2026*
+*Last update: October 2026*

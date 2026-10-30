@@ -1,8 +1,9 @@
 /**
  * @file    surgery_monitor_web_server.ino
- * PROJECT: Vital-signs monitor — small rodents (rat / mouse)
- * @version 2.0
+ * PROJECT: Vital-signs monitor
+ * @version 1.0
  * @author  Flávio Mourão — Mar, 2026
+ * @updated Oct, 2026
  *
  * ═══════════════════════════════════════════════════════════════════════════════
  * MODULE RESPONSIBILITY
@@ -64,7 +65,16 @@
  * ═══════════════════════════════════════════════════════════════════════════════
  * vitalsigns_update() is called at the end of every loop() iteration in
  * surgery_monitor.ino. It uses a millis()-based gate (INTERVAL_VS_MS = 10 ms)
- * so it fires at ~100 Hz regardless of how fast loop() runs.
+ * so it fires at ~100 Hz, provided loop() itself runs faster than 10 ms (at
+ * most one packet is sent per call).
+ *
+ * The schedule starts at millis() in vitalsigns_init() and resynchronises after
+ * a stall (bounded catch-up) instead of sending a burst of back-to-back
+ * packets with a duplicated IR value and 1–3 ms timestamp spacing. Starting
+ * the timer at 0 would fire ~350 packets right after the 3 s boot splash.
+ *
+ * The USB stream (Py_Vital-Signs.ino) sends the same packet at the same rate
+ * on Serial0; both streams share the loop() time budget.
  *
  * Serial3.print() is blocking on ATmega: at 115200 baud, each byte takes ~87 µs
  * to shift out. A 65-byte packet takes ~5.7 ms. Since this task runs at 100 Hz
@@ -110,6 +120,7 @@ void vitalsigns_init()
     // On the RobotDyn Mega+WiFi these pins are bridged internally to the
     // ESP8266 UART — no external wiring required.
     Serial3.begin(115200);
+    timerVS = millis();   // schedule starts now (see TIMING above)
     Serial.println(F("[OK] ESP8266 stream initialised on Serial3 @ 115200 baud."));
 }
 
@@ -127,6 +138,8 @@ void vitalsigns_update()
 
     if (nowMs - timerVS < INTERVAL_VS_MS) return;
     timerVS += INTERVAL_VS_MS;
+    // Bounded catch-up: resynchronise after a stall instead of bursting.
+    if (nowMs - timerVS >= INTERVAL_VS_MS) timerVS = nowMs;
 
     // Atomic snapshot of ISR-written volatile variables.
     // adcDisplay and respRate are written by TIMER1_COMPA_vect — a torn read
