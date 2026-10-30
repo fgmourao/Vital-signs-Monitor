@@ -1,4 +1,4 @@
-# Vital-signs Monitor v1.1
+# Vital-signs Monitor v1.0
 > **Under development**
 
 Real-time, non-invasive physiological monitoring during experimental surgeries, stereotaxic procedures, and deep anaesthesia protocols in small rodents. ATmega2560 acquisition board controlled by a Python/PyQt5 application over USB, with simultaneous Wi-Fi browser dashboard via an on-board ESP8266.
@@ -266,13 +266,13 @@ The SparkFun `checkForBeat()` detector was calibrated for unaveraged signals. Wi
 `checkForBeat()` accepts a beat only if the previous cycle's AC peak-to-peak is between 20 and 1000 counts; with a larger amplitude every beat is rejected (HR then stays at 0 after the timeout). Its 23-tap FIR low-pass (−3 dB ≈ 3 Hz) also strongly attenuates rodent cardiac frequencies (5–8 Hz: gain ≈0.36–0.04 relative to DC), so it is not expected to work reliably in rats and mice. The planned replacement is a band-pass (3.5–12 Hz) plus adaptive threshold detector (`alt_hr_detector.m`).
 
 **[T3] ADC Range**
-`adcRange = 16384` is required for human fingertip at LED = 80 to avoid saturation (IR DC reaches 262,143 = 18-bit ceiling). For rodent thin tissue, try `adcRange = 4096` and verify IR raw in the waveform plot.
+`adcRange = >8192` is required for human fingertip at LED = 25 to avoid saturation. For rodent thin tissue, try `adcRange = <4096` and verify IR raw in the waveform plot.
 
 **[T4] IIR DC baseline convergence**
 The respiratory signal DC filter has a time constant of ~200 s at 100 Hz. When the animal is first placed on the sensor, the display may appear shifted until the filter converges. Use **Resp. Tare** to force immediate convergence.
 
 **[T5] SparkFun library internal buffer — STORAGE_SIZE**
-The SparkFun MAX3010x library uses an internal ring buffer (`STORAGE_SIZE`) to hold FIFO data between `check()` calls. The default value of 4 samples causes silent data loss whenever `loop()` is delayed beyond ~40 ms (e.g. by the OLED display task), producing irregular sample spacing in `irBuffer[]` and `redBuffer[]`. This distorts the Maxim FIR filters and typically causes SpO2 to read 100% or HR to be erratic. The OLED is now drawn page-wise (non-blocking), so `loop()` runs at ~10 ms, but the larger buffer is kept as a safeguard. This project set `STORAGE_SIZE = 64` by editing `MAX30105.h` at `~/Documents/Arduino/libraries/SparkFun_MAX3010x_Sensor_Library/src/MAX30105.h`
+The SparkFun MAX3010x library uses an internal ring buffer (`STORAGE_SIZE`) to hold FIFO data between `check()` calls. The default value of 4 samples causes silent data loss whenever `loop()` is delayed beyond ~40 ms (e.g. by the OLED display task), producing irregular sample spacing in `irBuffer[]` and `redBuffer[]`. This distorts the Maxim FIR filters and typically causes SpO2 to read 100% or HR to be erratic. The OLED is drawn page-wise (non-blocking), so `loop()` runs at ~10 ms, but the larger buffer is kept as a safeguard. This project set `STORAGE_SIZE = 64` by editing `MAX30105.h` at `~/Documents/Arduino/libraries/SparkFun_MAX3010x_Sensor_Library/src/MAX30105.h`
 
 **[T6] SpO2 reference values**
 The Maxim `spo2_algorithm` lookup table was calibrated for adult human fingertip measurements. In anaesthetised rodents, SpO2 values of 88–95% have been reported in the literature. If the monitor reads 99–100% during rodent anaesthesia, this may reflect algorithm miscalibration (next steps...)
@@ -347,7 +347,7 @@ This setting controls the size of the library's internal ring buffer. With the d
 
 ## Author
 
-**v1.1 (2026)**
+**v1.0 (2026)**
 Flavio Afonso Goncalves Mourao — [mourao.fg@gmail.com](mailto:mourao.fg@gmail.com)
 *CNPq/MCTI/FNDCT Nº 21/2024 — Processo 446467/2024-3*
 *Federal University of Minas Gerais, Brazil*
