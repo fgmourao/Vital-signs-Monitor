@@ -1,6 +1,5 @@
 <p align="right">
-  <img src="https://raw.githubusercontent.com/fgmourao/Vital-signs-Monitor/main/Images/image.png" width="100" />
-</p>
+  <img src="https://raw.githubusercontent.com/fgmourao/Vital-signs-Monitor/main/Images/image.png" width="120" />
 
 # Vital-signs Monitor v1.0
 > **Under development**
